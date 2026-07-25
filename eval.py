@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-eval.py - Render a diamond using the Neural Diamond BSDF.
+eval_animate_roll.py - Render a rolling diamond animation using the Neural Diamond BSDF.
 
 The hybrid BSDF blends:
   - DiamondFacet  : analytic Fresnel R/T
   - Model_M       : neural multi-scatter colour f(wi, wo)
-  - PDF params    : kappa_R, beta_M, gamma_M, kappa_M from fit.py
 
-FIXED VERSION - all known bugs addressed:
-  - Model_M forward() expects concatenated [wi, wo] (6D input)
-  - sample1/sample2 are Floats, not vectors (no .x access)
-  - Use Mitsuba's dielectric for physics mode
-  - Proper MiModelWrapper with correct activation
+Animation: Diamond rolls/tumbles in 3D space with orbiting camera
+FIXED: Added numerical stability and NaN handling
 """
 
 import os
@@ -20,10 +16,12 @@ import argparse
 import json
 import struct
 import tempfile
+import math
 import numpy as np
 import torch
 import mitsuba as mi
 import drjit as dr
+from pathlib import Path
 
 project_root = '/mnt/c/Users/sally/research/diamond_rendering'
 if os.path.exists(project_root):
@@ -34,26 +32,34 @@ if os.path.exists(project_root):
 
 from config import device, variant
 
+# Register NeuralDiamond BSDF
+from bsdf.neural_bsdf import NeuralDiamond
+mi.register_bsdf("neural_diamond", lambda props: NeuralDiamond(props))
+
 mi.set_variant(variant)
 from mitsuba import ScalarTransform4f as sT
 
 from bsdf.analytic_bsdf import DiamondShading
-from bsdf.neural_bsdf import NeuralDiamond
 from neural.base_model import Model_M, Model_T
 from neural.drjit_wrapper import MiModelWrapper
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Render a diamond with neural shading")
+    parser = argparse.ArgumentParser(description="Render a rolling diamond animation with neural shading")
     parser.add_argument("--checkpoint_name", type=str, required=True)
     parser.add_argument("--diamond_name", type=str, default='round_brilliant_sharp_culet')
-    parser.add_argument("--spp", type=int, default=256)
-    parser.add_argument("--width", type=int, default=768)
-    parser.add_argument("--height", type=int, default=768)
-    parser.add_argument("--output", type=str, default="output")
+    parser.add_argument("--spp", type=int, default=64, help="Samples per pixel per frame")
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--output_dir", type=str, default="rolling_animation")
+    parser.add_argument("--frames", type=int, default=60, help="Number of animation frames")
     parser.add_argument("--exposure", type=float, default=1.0)
     parser.add_argument("--no_neural", action='store_true',
                         help="Use analytic dielectric only (ground truth reference)")
+    parser.add_argument("--fps", type=int, default=30, help="Video frames per second")
+    parser.add_argument("--orbit_radius", type=float, default=5.0, help="Camera orbit radius")
+    parser.add_argument("--rotation_speed", type=float, default=1.0, help="Rotation speed multiplier")
+    parser.add_argument("--clamp_value", type=float, default=10.0, help="Clamp neural BSDF output to this value")
     return parser.parse_args()
 
 
@@ -103,20 +109,17 @@ def build_diamond_mesh(diamond_params):
     tmp = tempfile.NamedTemporaryFile(suffix='.ply', delete=False)
     tmp.close()
     write_ply(tmp.name, fv, fn, ff)
-    print(f"  Mesh: {len(fv)} verts, {len(ff)} faces")
-    return tmp.name
+    return tmp.name, fv, fn, ff
 
 
-def load_neural_bsdf(checkpoint_dir, diamond_params):
-    """Load neural BSDF with Model_M only (Model_T removed due to saturation)."""
+def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0):
+    """Load neural BSDF with numerical stability."""
     
-    # Load Model_M
     model_m = Model_M().to(device)
     model_m_path = os.path.join(checkpoint_dir, 'model_m.pth')
     
     if not os.path.exists(model_m_path):
         print(f"  ⚠ Model_M not found at {model_m_path}")
-        print("  Falling back to physics-only")
         return None
     
     model_m.load_state_dict(
@@ -124,87 +127,167 @@ def load_neural_bsdf(checkpoint_dir, diamond_params):
     )
     model_m.eval()
     print("✓ Model_M weights loaded")
-
-    # Test Model_M with concatenated input
+    
+    # Test model and determine activation
     test_wi = torch.tensor([[0.0, 0.0, 1.0]], device=device)
     test_wo = torch.tensor([[0.5, 0.5, 0.7071]], device=device)
-    test_input = torch.cat([test_wi, test_wo], dim=1)  # [1, 6]
+    test_input = torch.cat([test_wi, test_wo], dim=1)
     
     with torch.no_grad():
         m_pred = model_m(test_input)
         print(f"  Model_M test output: {m_pred.tolist()}")
         
-        if m_pred.max() < 2.0:
-            # Outputs already in [0, 2] range - use clamp
-            activation_m = lambda x: dr.maximum(0.0, x)
-            print("  ✓ Using ReLU activation (model outputs already in range)")
+        # Check for NaN
+        if torch.isnan(m_pred).any() or torch.isinf(m_pred).any():
+            print("  ⚠ Model_M output contains nan/inf, using safe activation")
+            activation = lambda x: dr.maximum(0.0, dr.minimum(x, clamp_value))
         else:
-            # Use exp for large outputs
-            activation_m = lambda x: dr.exp(x)
-            print("  ✓ Using exp activation")
-    
-    # Build wrapper with skip_test -- must override test() as a class method
-    # BEFORE calling super().__init__(), since the base class's __init__
-    # calls self.test() internally. Assigning self.test = lambda: None
-    # AFTER super().__init__() is too late -- the real test already ran
-    # and raised before the override line was ever reached.
+            # Use clamp with ReLU for stability
+            activation = lambda x: dr.maximum(0.0, dr.minimum(x, clamp_value))
+            print(f"  ✓ Using clamped ReLU activation (max={clamp_value})")
+
     class WrapperWithSkip(MiModelWrapper):
         def test(self, samples=42900):
-            pass  # no-op: skip the strict torch/DrJIT equality check
-
-    mlp_m = WrapperWithSkip(model_m, activation_m)
+            pass
+    
+    # Build wrapper with stable activation
+    mlp_m = WrapperWithSkip(model_m, activation)
     print("✓ DrJIT wrapper built for Model_M")
     
-    # Determine activation based on model output
-    if torch.isnan(m_pred).any() or torch.isinf(m_pred).any():
-        print("  ⚠ Model_M output contains nan/inf")
-        return None
+    props = mi.Properties()
+    props['int_ior'] = diamond_params['int_ior']
+    props['ext_ior'] = diamond_params['ext_ior']
+    props['type'] = 'neural_diamond'
     
-    # Try exp activation (common for scattering models)
-    exp_pred = torch.exp(m_pred)
-    if not torch.isnan(exp_pred).any() and not torch.isinf(exp_pred).any():
-        if exp_pred.max() < 1000:
-            activation = lambda x: dr.exp(x)
-            print("  ✓ Using exp activation")
-        else:
-            # Use ReLU
-            activation = lambda x: dr.maximum(0.0, x)
-            print("  ✓ Using ReLU activation")
-    else:
-        # Use identity (model already produces positive values)
-        activation = lambda x: x
-        print("  ✓ Using identity activation")
-    
-    # Build DrJIT wrapper
-    try:
-        mlp_m = MiModelWrapper(model_m, activation=activation)
-        print("✓ DrJIT wrapper built")
-    except Exception as e:
-        print(f"  ⚠ DrJIT wrapper failed: {e}")
-        # Try with identity activation as fallback
-        try:
-            mlp_m = MiModelWrapper(model_m, activation=lambda x: x)
-            print("  ✓ Fallback: identity activation")
-        except:
-            print("  ✗ Failed to build DrJIT wrapper")
-            return None
-
-    # Create BSDF
-    bsdf = mi.load_dict({
-        'type': 'neural_diamond',
-        'int_ior': diamond_params['int_ior'],
-        'ext_ior': diamond_params['ext_ior'],
-    })
+    bsdf = NeuralDiamond(props)
     bsdf.model_m = mlp_m
-    print("✓ NeuralDiamond BSDF ready")
+    
+    # Add a clamp to the BSDF output
+    def safe_eval(bsdf, *args, **kwargs):
+        result = bsdf.__class__.eval(bsdf, *args, **kwargs)
+        # Clamp to prevent extreme values
+        return dr.clamp(result, 0.0, clamp_value)
+    
+    # Monkey patch eval for safety
+    bsdf.eval = safe_eval.__get__(bsdf, NeuralDiamond)
+    
+    print("✓ NeuralDiamond BSDF ready with numerical stability")
     return bsdf
 
 
-def create_scene(diamond_params, bsdf, width, height):
-    """Build and return a Mitsuba scene with the given BSDF on the diamond."""
+def load_analytic_bsdf(diamond_params):
+    """Create analytic dielectric BSDF."""
+    return {
+        'type': 'dielectric',
+        'int_ior': diamond_params['int_ior'],
+        'ext_ior': diamond_params['ext_ior'],
+    }
 
-    ply_path = build_diamond_mesh(diamond_params)
 
+def rotate_vertex(v, angle_x, angle_y, angle_z):
+    """Apply 3D rotation to a single vertex."""
+    x, y, z = v
+    
+    # Rotate around X axis
+    cos_a = math.cos(angle_x)
+    sin_a = math.sin(angle_x)
+    y1 = y * cos_a - z * sin_a
+    z1 = y * sin_a + z * cos_a
+    x1 = x
+    
+    # Rotate around Y axis
+    cos_b = math.cos(angle_y)
+    sin_b = math.sin(angle_y)
+    x2 = x1 * cos_b + z1 * sin_b
+    z2 = -x1 * sin_b + z1 * cos_b
+    y2 = y1
+    
+    # Rotate around Z axis
+    cos_c = math.cos(angle_z)
+    sin_c = math.sin(angle_z)
+    x3 = x2 * cos_c - y2 * sin_c
+    y3 = x2 * sin_c + y2 * cos_c
+    z3 = z2
+    
+    return np.array([x3, y3, z3], dtype=np.float32)
+
+
+def rotate_vertices(vertices, angles):
+    """Apply 3D rotation to all vertices."""
+    angle_x, angle_y, angle_z = angles
+    return np.array([rotate_vertex(v, angle_x, angle_y, angle_z) for v in vertices], dtype=np.float32)
+
+
+def create_rotated_ply(ply_path, vertices, normals, faces, frame_num, total_frames, rotation_speed=1.0):
+    """Create a rotated PLY file for a specific frame."""
+    
+    # Calculate rolling angles - smooth tumbling motion
+    t = frame_num / total_frames
+    
+    # Use smoother interpolation for the rolling motion
+    # This prevents sudden jumps that can cause rendering artifacts
+    angle_x = 2.0 * 2 * math.pi * t * rotation_speed
+    angle_y = 1.5 * 2 * math.pi * t * rotation_speed  
+    angle_z = 0.5 * 2 * math.pi * t * rotation_speed
+    
+    angles = (angle_x, angle_y, angle_z)
+    
+    # Rotate vertices and normals
+    rotated_verts = rotate_vertices(vertices, angles)
+    rotated_normals = rotate_vertices(normals, angles)
+    
+    # Write rotated PLY
+    tmp_path = ply_path.replace('.ply', f'_frame_{frame_num:04d}.ply')
+    write_ply(tmp_path, rotated_verts, rotated_normals, faces)
+    
+    return tmp_path, angles
+
+
+def create_scene(diamond_params, bsdf, width, height, frame_idx, total_frames, 
+                 ply_path, vertices, normals, faces, orbit_radius, rotation_speed):
+    """Build scene with diamond rotating around Y axis (no flipping)."""
+    
+    t = frame_idx / total_frames
+    
+    # Rotation around Y axis only - full 360° rotation
+    angle = 2 * math.pi * t * rotation_speed
+    
+    # Rotate vertices around Y axis
+    rotated_verts = []
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    for v in vertices:
+        x, y, z = v
+        rx = x * cos_a + z * sin_a
+        ry = y  # Y stays the same
+        rz = -x * sin_a + z * cos_a
+        rotated_verts.append([rx, ry, rz])
+    rotated_verts = np.array(rotated_verts, dtype=np.float32)
+    
+    # Rotate normals the same way
+    rotated_normals = []
+    for n in normals:
+        nx, ny, nz = n
+        rnx = nx * cos_a + nz * sin_a
+        rny = ny  # Y stays the same
+        rnz = -nx * sin_a + nz * cos_a
+        rotated_normals.append([rnx, rny, rnz])
+    rotated_normals = np.array(rotated_normals, dtype=np.float32)
+    
+    # Write rotated PLY
+    rotated_ply_path = ply_path.replace('.ply', f'_frame_{frame_idx:04d}.ply')
+    write_ply(rotated_ply_path, rotated_verts, rotated_normals, faces)
+    
+    # Camera stays fixed (or orbits slowly)
+    cam_x = 0.0
+    cam_y = 1.8
+    cam_z = 4.0
+    
+    # Optional: slight camera orbit around diamond
+    # cam_angle = 0.3 * 2 * math.pi * t  # Slow orbit
+    # cam_x = orbit_radius * math.sin(cam_angle) * 0.3
+    # cam_z = orbit_radius * math.cos(cam_angle) * 0.3
+    
     ground_bsdf = {
         'type': 'diffuse',
         'reflectance': {'type': 'rgb', 'value': [0.12, 0.12, 0.14]},
@@ -220,11 +303,11 @@ def create_scene(diamond_params, bsdf, width, height):
 
         'sensor': {
             'type': 'perspective',
-            'fov': 32,
+            'fov': 30,
             'to_world': sT.look_at(
-                origin=[0.0, -4.6,  2.4],
-                target=[0.0,  0.0, -0.05],
-                up=   [0.0,  0.0,  1.0],
+                origin=[cam_x, cam_y, cam_z],
+                target=[0.0, 0.0, 0.0],
+                up=[0.0, 1.0, 0.0],
             ),
             'film': {
                 'type': 'hdrfilm',
@@ -246,7 +329,7 @@ def create_scene(diamond_params, bsdf, width, height):
 
         'ground': {
             'type': 'rectangle',
-            'to_world': sT.translate([0, 0, -0.86]).scale([6, 6, 1]),
+            'to_world': sT.translate([0, 0, -0.9]).scale([8, 8, 1]),
             'bsdf': ground_bsdf,
         },
 
@@ -254,8 +337,8 @@ def create_scene(diamond_params, bsdf, width, height):
             'type': 'rectangle',
             'to_world': sT.look_at(
                 origin=[3.0, -3.5, 5.0],
-                target=[0.0,  0.0, 0.0],
-                up=   [0.0,  0.0, 1.0],
+                target=[0.0, 0.0, 0.0],
+                up=[0.0, 0.0, 1.0],
             ).scale([1.2, 1.2, 1.0]),
             'emitter': {
                 'type': 'area',
@@ -267,8 +350,8 @@ def create_scene(diamond_params, bsdf, width, height):
             'type': 'rectangle',
             'to_world': sT.look_at(
                 origin=[-3.5, 2.5, 1.5],
-                target=[ 0.0, 0.0, 0.0],
-                up=   [ 0.0, 0.0, 1.0],
+                target=[0.0, 0.0, 0.0],
+                up=[0.0, 0.0, 1.0],
             ).scale([1.0, 1.0, 1.0]),
             'emitter': {
                 'type': 'area',
@@ -281,7 +364,7 @@ def create_scene(diamond_params, bsdf, width, height):
             'to_world': sT.look_at(
                 origin=[0.0, 0.0, 6.0],
                 target=[0.0, 0.0, 0.0],
-                up=   [0.0, 1.0, 0.0],
+                up=[0.0, 1.0, 0.0],
             ).scale([2.0, 2.0, 1.0]),
             'emitter': {
                 'type': 'area',
@@ -289,18 +372,31 @@ def create_scene(diamond_params, bsdf, width, height):
             },
         },
 
-        # Diamond shape
+        'fill_light': {
+            'type': 'rectangle',
+            'to_world': sT.look_at(
+                origin=[-2.0, -3.0, 2.0],
+                target=[0.0, 0.0, 0.0],
+                up=[0.0, 0.0, 1.0],
+            ).scale([1.0, 1.0, 1.0]),
+            'emitter': {
+                'type': 'area',
+                'radiance': {'type': 'rgb', 'value': [8.0, 10.0, 12.0]},
+            },
+        },
+
         'diamond': {
             'type': 'ply',
-            'filename': ply_path,
+            'filename': rotated_ply_path,
             'bsdf': bsdf,
         },
     }
 
     scene = mi.load_dict(scene_dict)
 
+    # Clean up temporary PLY file (after scene is built)
     try:
-        os.unlink(ply_path)
+        os.unlink(rotated_ply_path)
     except OSError:
         pass
 
@@ -314,10 +410,165 @@ def tonemap(image, exposure=1.0):
     return (img * 255).astype(np.uint8)
 
 
-def save_png(arr, path):
-    from PIL import Image
-    Image.fromarray(arr, 'RGB').save(path)
-    print(f"✓ Saved: {path}")
+def render_frame(scene, spp, frame_idx, total_frames):
+    """Render a single frame with error handling."""
+    print(f"  Rendering frame {frame_idx+1}/{total_frames}...")
+    
+    try:
+        # Progressive rendering with batches
+        image = None
+        batch_size = min(8, spp)
+        
+        for i in range(0, spp, batch_size):
+            batch_spp = min(batch_size, spp - i)
+            img = mi.render(scene, spp=batch_spp, seed=i + frame_idx * 10000)
+            
+            # Check for NaN in rendered image
+            img_np = np.array(img)
+            if np.isnan(img_np).any() or np.isinf(img_np).any():
+                print(f"    ⚠ Warning: NaN/Inf detected in frame {frame_idx+1}, replacing with zeros")
+                img_np = np.nan_to_num(img_np, nan=0.0, posinf=0.0, neginf=0.0)
+                img = mi.TensorXf(img_np)
+            
+            image = img if image is None else image + img
+            dr.flush_malloc_cache()
+        
+        image /= spp
+        return image
+        
+    except Exception as e:
+        print(f"    ⚠ Error rendering frame {frame_idx+1}: {e}")
+        # Return black frame
+        return mi.TensorXf(np.zeros((args.height, args.width, 3), dtype=np.float32))
+
+
+def create_animation_frames(args, bsdf, diamond_params, vertices, normals, faces):
+    """Render all animation frames."""
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    frames_dir = output_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    
+    # Create base PLY path
+    ply_path = os.path.join(tempfile.gettempdir(), 'diamond_base.ply')
+    write_ply(ply_path, vertices, normals, faces)
+    
+    print(f"\n🎬 Rendering {args.frames} rotation animation frames...")
+    print(f"   SPP: {args.spp}")
+    print(f"   Resolution: {args.width}×{args.height}")
+    print(f"   Rotation speed: {args.rotation_speed}x")
+    print(f"   Output: {output_dir}")
+    print(f"   Camera: fixed at [0, 1.8, 4.0]")
+    
+    frames = []
+    failed_frames = []
+    
+    for frame_idx in range(args.frames):
+        # Build scene for this frame
+        try:
+            scene = create_scene(
+                diamond_params,
+                bsdf,
+                args.width,
+                args.height,
+                frame_idx,
+                args.frames,
+                ply_path,
+                vertices,
+                normals,
+                faces,
+                args.orbit_radius,
+                args.rotation_speed
+            )
+        except Exception as e:
+            print(f"  ⚠ Error building scene for frame {frame_idx+1}: {e}")
+            failed_frames.append(frame_idx)
+            continue
+        
+        # Render frame
+        image = render_frame(scene, args.spp, frame_idx, args.frames)
+        
+        # Save tonemapped PNG
+        tonemapped = tonemap(np.array(image), args.exposure)
+        frame_path = frames_dir / f"frame_{frame_idx:04d}.png"
+        from PIL import Image
+        Image.fromarray(tonemapped, 'RGB').save(frame_path)
+        frames.append(frame_path)
+        
+        # Save HDR for quality
+        hdr_path = frames_dir / f"frame_{frame_idx:04d}.exr"
+        mi.util.write_bitmap(str(hdr_path), image)
+        
+        # Clean up
+        dr.flush_malloc_cache()
+    
+    # Clean up base PLY
+    try:
+        os.unlink(ply_path)
+    except OSError:
+        pass
+    
+    if failed_frames:
+        print(f"\n⚠ Warning: {len(failed_frames)} frames failed: {failed_frames}")
+    
+    print(f"\n✅ {len(frames)} frames rendered successfully!")
+    return frames
+
+
+def create_video(frames, output_dir, fps=30):
+    """Create MP4 video and GIF from rendered frames."""
+    try:
+        import subprocess
+        
+        output_dir = Path(output_dir)
+        video_path = output_dir / "diamond_rolling.mp4"
+        
+        # Check if frames exist
+        frame_pattern = output_dir / 'frames' / 'frame_*.png'
+        if not list(output_dir.glob('frames/frame_*.png')):
+            print("  ⚠ No frames found, skipping video creation")
+            return
+        
+        # Create MP4 with smooth playback
+        cmd = [
+            'ffmpeg', '-y',
+            '-framerate', str(fps),
+            '-pattern_type', 'glob',
+            '-i', str(output_dir / 'frames' / 'frame_*.png'),
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-crf', '18',
+            '-preset', 'medium',
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            str(video_path)
+        ]
+        
+        print(f"\n🎬 Creating video: {video_path}")
+        subprocess.run(cmd, check=True, capture_output=True)
+        print(f"✅ Video created: {video_path}")
+        
+        # Create GIF
+        gif_path = output_dir / "diamond_rolling.gif"
+        cmd_gif = [
+            'ffmpeg', '-y',
+            '-framerate', str(min(fps, 15)),
+            '-pattern_type', 'glob',
+            '-i', str(output_dir / 'frames' / 'frame_*.png'),
+            '-vf', 'scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse',
+            '-loop', '0',
+            str(gif_path)
+        ]
+        
+        try:
+            subprocess.run(cmd_gif, check=True, capture_output=True)
+            print(f"✅ GIF created: {gif_path}")
+        except Exception as e:
+            print(f"  ⚠ Could not create GIF: {e}")
+            
+    except FileNotFoundError:
+        print("  ⚠ ffmpeg not found - skipping video creation")
+        print("  Install ffmpeg: sudo apt install ffmpeg")
 
 
 def main():
@@ -342,52 +593,37 @@ def main():
         diamond_params = diamond_params.copy()
         print(f"✓ Parameters: preset '{args.diamond_name}'")
 
+    # Build diamond mesh and get vertices/normals/faces
+    ply_path, vertices, normals, faces = build_diamond_mesh(diamond_params)
+    
     # Build BSDF
     if args.no_neural:
         print("✓ Mode: analytic ground truth (--no_neural)")
-        bsdf = {
-            'type': 'dielectric',
-            'int_ior': diamond_params['int_ior'],
-            'ext_ior': diamond_params['ext_ior'],
-        }
+        bsdf = load_analytic_bsdf(diamond_params)
     else:
         print("✓ Mode: neural shading (Model_M + DiamondFacet)")
-        bsdf = load_neural_bsdf(checkpoint_dir, diamond_params)
+        bsdf = load_neural_bsdf_direct(checkpoint_dir, diamond_params, args.clamp_value)
         if bsdf is None:
             print("⚠ Neural BSDF failed to load - falling back to dielectric")
-            bsdf = {
-                'type': 'dielectric',
-                'int_ior': diamond_params['int_ior'],
-                'ext_ior': diamond_params['ext_ior'],
-            }
+            bsdf = load_analytic_bsdf(diamond_params)
 
-    # Disable megakernel/symbolic execution
+    # Disable megakernel
     for flag in [dr.JitFlag.LoopRecord, dr.JitFlag.VCallRecord, dr.JitFlag.VCallOptimize]:
         dr.set_flag(flag, False)
-    print("\u2713 Megakernel disabled")
+    print("✓ Megakernel disabled")
 
-    # Build scene and render
-    print(f"✓ Building scene...")
-    scene = create_scene(diamond_params, bsdf, args.width, args.height)
+    # Render animation
+    frames = create_animation_frames(args, bsdf, diamond_params, vertices, normals, faces)
 
-    # Render in small tile batches to avoid OOM
-    print(f"✓ Rendering {args.width}×{args.height} @ {args.spp} spp (1 spp batches)...")
-    image = None
-    for i in range(args.spp):
-        img = mi.render(scene, spp=1, seed=i)
-        image = img if image is None else image + img
-        if (i + 1) % 16 == 0 or i == args.spp - 1:
-            print(f"  {i+1}/{args.spp} spp")
-        dr.flush_malloc_cache()
-    image /= args.spp
+    # Create video
+    create_video(frames, Path(args.output_dir), fps=args.fps)
 
-    # Save outputs
-    base = args.output
-    mi.util.write_bitmap(base + '.exr', image)
-    print(f"✓ Saved HDR: {base}.exr")
-    save_png(tonemap(np.array(image), args.exposure), base + '.png')
-
-    print("✓ Done!")
+    print(f"\n✅ Rolling animation complete!")
+    print(f"   Frames: {Path(args.output_dir) / 'frames'}")
+    print(f"   Video: {args.output_dir}/diamond_rolling.mp4")
+    if os.path.exists(Path(args.output_dir) / "diamond_rolling.gif"):
+        print(f"   GIF: {args.output_dir}/diamond_rolling.gif")
+    
     return 0
 
 

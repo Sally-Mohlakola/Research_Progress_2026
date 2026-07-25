@@ -134,25 +134,6 @@ def build_diamond_scene(
 # ─────────────────────────────────────────────
 
 def trace_path(scene, rays, max_depth=10000):
-    """
-    Trace `rays` through `scene`, bouncing according to the hit BSDF at
-    each step, for up to `max_depth` bounces or until a ray exits the
-    scene (no further intersection).
-
-    Returns
-    -------
-    wi          : incoming direction (world space, pointing back toward
-                  the ray origin) at the FIRST hit -- this is the true
-                  incident illumination direction for the histogram.
-    wo          : outgoing direction (world space) of the ray once it
-                  escapes the scene (or once max_depth is reached).
-    throughput  : accumulated BSDF throughput (mi.Spectrum) along the path.
-    depth       : number of bounces taken before escaping / stopping.
-    frame       : shading frame at the FIRST hit (used to convert wi/wo to
-                  the first hit's local frame for binning).
-    escaped     : boolean mask, True for rays that exited the scene
-                  (no intersection) before hitting max_depth.
-    """
     n_samples = dr.shape(rays.o)[1]
     sampler = mi.load_dict({"type": "independent"})
     sampler.seed(np.random.randint(np.iinfo(np.int32).max), wavefront_size=n_samples)
@@ -235,17 +216,6 @@ def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360
         & (phi_o_idx >= 0) & (phi_o_idx < phi_bins)
     )
 
-    # NOTE: `arr[mask]` in Dr.Jit is NOT a NumPy-style boolean-mask
-    # compaction -- it returns the array unchanged (verified directly:
-    # mi.UInt32([1,2,3,4,5])[mi.Bool([T,F,T,F,T])] has length 5, not 3).
-    # The previous version of this function relied on that pattern to
-    # "filter out" invalid bin indices before scattering, which silently
-    # did nothing -- out-of-range indices were then scattered directly
-    # into the histogram buffer, corrupting memory. The correct fix is to
-    # pass `active=valid_mask` straight to `scatter_reduce`, which
-    # Dr.Jit supports natively and is confirmed safe even when the
-    # (unused, inactive-lane) index value itself is out of range.
-
     shape = (theta_bins // 2, phi_bins, theta_bins, phi_bins, 3)
     s = dr.zeros(mi.Float, dr.prod(shape))
 
@@ -318,20 +288,6 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
         print(f"  [warn] {not_escaped}/{num_samples} rays did not escape "
               f"within max_depth={max_depth} (trapped by total internal reflection)")
 
-    # depth==1: a single bounce off the first surface, exiting back out
-    # the same side it entered -> direct reflectance.
-    # depth>=2 and escaped: light that passed all the way through and
-    # out the scene (any exit direction) -> lumped as transmittance vs.
-    # multi-scatter below based on which side of the first surface it
-    # exits from, matching the original transmittance/reflectance/
-    # multi-scatter split.
-    #
-    # IMPORTANT: rays that hit max_depth while still trapped inside the
-    # stone (escaped == False) never produced a genuine exit direction --
-    # their `wo` is just whatever direction the loop happened to be
-    # pointing when it gave up, not a real measurement of where light
-    # left the diamond. These must be excluded from every selection
-    # below, not just tallied in the warning above.
     select_r = escaped & (depth == 1) & (dr.dot(wo, frame.n) > 0.0)
     select_t = escaped & (depth == 1) & ~select_r
     select_m = escaped & (depth >= 2)

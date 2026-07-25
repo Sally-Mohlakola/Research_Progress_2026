@@ -104,48 +104,45 @@ class NeuralDiamond(mi.BSDF):
     # RDM-based direction sampling
     # ------------------------------------------------------------------
     
-    def _wi_to_numpy(self, wi):
-        """Extract first active wi as numpy vector for RDM bin lookup."""
-        wx = dr.slice(wi.x, 0)
-        wy = dr.slice(wi.y, 0)
-        wz = dr.slice(wi.z, 0)
-        return np.array([float(wx), float(wy), float(wz)], dtype=np.float32)
-    
+    def _dir_to_spherical(self, v):
+        """
+        Convert a Dr.Jit Vector3f to (theta, phi) angle arrays,
+        one value per ray -- fully vectorized, no dr.slice().
+        Convention: theta from +Z (matching how the RDM was collected
+        in gather_rdm.py: theta_i = dr.acos(omega_i.z)).
+        """
+        theta = dr.acos(dr.clip(v.z, -1.0, 1.0))
+        phi   = dr.atan2(v.y, v.x)
+        return theta, phi
+
     def sample_from_rdm(self, wi, sample1, sample2):
         """
-        Sample outgoing direction from RDM histogram.
-        
-        Uses the RDM sampler to draw directions from the learned distribution.
+        Per-ray vectorized direction sampling from the RDM alias table.
+
+        Every ray in the batch independently looks up its own
+        (theta_i, phi_i) bin and draws its own outgoing direction --
+        no dr.slice(), no broadcast of a single shared direction.
+        sample2 supplies two independent uniform variates per ray
+        (sample2.x for alias selection, sample2.y for alias accept/reject).
         """
         if self.rdm_sampler is None:
-            # Fallback: uniform hemisphere
-            wo = mi.warp.square_to_uniform_hemisphere(sample2)
+            wo  = mi.warp.square_to_uniform_hemisphere(sample2)
             pdf = mi.warp.square_to_uniform_hemisphere_pdf(wo)
             return wo, pdf
-        
-        # Get representative incoming direction
-        wi_np = self._wi_to_numpy(wi)
-        
-        # Convert to spherical coordinates
-        theta_i = float(dr.acos(wi_np[2]))
-        phi_i = float(dr.atan2(wi_np[1], wi_np[0]))
-        
-        # Sample from RDM
-        u1 = float(dr.slice(sample1, 0))
-        u2 = float(dr.slice(sample2, 0))
-        
-        theta_o, phi_o, pdf_val = self.rdm_sampler.sample_outgoing(
-            theta_i, phi_i, u1, u2
+
+        theta_i, phi_i = self._dir_to_spherical(wi)
+
+        # sample_outgoing expects Dr.Jit Float arrays (one per ray).
+        # Returns theta_o, phi_o, pdf -- all Dr.Jit Float, same width.
+        theta_o, phi_o, pdf = self.rdm_sampler.sample_outgoing(
+            theta_i, phi_i, sample2.x, sample2.y,
         )
-        
-        # Convert to vector
+
         wo = mi.Vector3f(
             dr.sin(theta_o) * dr.cos(phi_o),
             dr.sin(theta_o) * dr.sin(phi_o),
-            dr.cos(theta_o)
+            dr.cos(theta_o),
         )
-        pdf = mi.Float(pdf_val)
-        
         return wo, pdf
     
     # ------------------------------------------------------------------
@@ -218,22 +215,15 @@ class NeuralDiamond(mi.BSDF):
     
     def pdf(self, ctx, si, wo, active):
         """
-        PDF for neural BSDF.
-        
-        Uses RDM sampler if available, else uniform.
+        Per-ray vectorized PDF lookup from the RDM alias table.
+        No dr.slice(), no broadcast -- every ray gets its own pdf value.
         """
         if self.rdm_sampler is not None:
-            wi_np = self._wi_to_numpy(si.wi)
-            wo_np = self._wi_to_numpy(wo)
-            
-            theta_i = float(dr.acos(wi_np[2]))
-            phi_i = float(dr.atan2(wi_np[1], wi_np[0]))
-            theta_o = float(dr.acos(wo_np[2]))
-            phi_o = float(dr.atan2(wo_np[1], wo_np[0]))
-            
-            pdf_val = self.rdm_sampler.pdf_outgoing(theta_i, phi_i, theta_o, phi_o)
-            return dr.full(mi.Float, pdf_val, dr.width(si.wi))
-        
+            theta_i, phi_i = self._dir_to_spherical(si.wi)
+            theta_o, phi_o = self._dir_to_spherical(wo)
+            pdf = self.rdm_sampler.pdf_outgoing(theta_i, phi_i, theta_o, phi_o)
+            return dr.select(active, pdf, 0.0)
+
         # Uniform fallback
         return mi.warp.square_to_uniform_hemisphere_pdf(wo)
     

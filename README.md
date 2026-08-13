@@ -1,1 +1,5 @@
-C:\Users\sally\research\diamond\output_gt.exr\diamond_rolling.gif
+
+
+https://github.com/user-attachments/assets/de108891-b999-4ee8-b94b-c1b79ec18364
+
+

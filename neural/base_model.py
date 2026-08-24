@@ -8,7 +8,7 @@ class Model_T(nn.Module):
         self.sequential = nn.Sequential(
             nn.Linear(3, 7), nn.PReLU(7),
             nn.Linear(7, 7), nn.PReLU(7),
-            nn.Linear(7, 1)
+            nn.Linear(7, 3)
         )
 
     def forward(self, x):

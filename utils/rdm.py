@@ -198,7 +198,7 @@ def trace_path(scene, rays, max_depth=10000):
 # 4D histogram accumulation
 # ─────────────────────────────────────────────
 
-def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360):
+def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360, sampling_method='uniform'):
     theta_i = dr.acos(dr.clip(omega_i.z, -1.0, 1.0))
     phi_i = dr.atan2(omega_i.y, omega_i.x)
     theta_o = dr.acos(dr.clip(omega_o.z, -1.0, 1.0))
@@ -233,11 +233,46 @@ def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360
     dr.scatter_reduce(dr.ReduceOp.Add, count_i, mi.Float(1), count_idx, active=valid_mask)
 
     solid_angles, _, _ = solid_angle_grid(theta_bins, phi_bins)
+    
+    # Get solid angles for incoming directions (θ_i only goes to 90°)
+    solid_angles_incoming = solid_angles[:theta_bins//2, :]
 
     histogram = mi.TensorXf(s, shape)
     histogram_count = mi.TensorXf(count_i, count_i_shape)
+    
+    # Divide by count per incoming direction (average throughput per sample)
     histogram = histogram / histogram_count[:, :, None, None, None]
+    
+    # Apply correction based on sampling method
+    if sampling_method == 'uniform':
+        # Uniform sphere sampling: p(ω_i) = solid_angle_incoming / (4π)
+        # Need to divide by p(ω_i) = multiply by 4π / solid_angle_incoming
+        histogram = histogram * (4.0 * np.pi) / mi.TensorXf(solid_angles_incoming)[:, :, None, None, None]
+    elif sampling_method == 'cos_theta':
+        # Uniform in cos(θ) sampling: p(ω_i) = 1/(2π) (independent of θ)
+        # PDF = 1/(2π) for all ω_i
+        histogram = histogram * (2.0 * np.pi)
+    elif sampling_method == 'stratified':
+        # Stratified sampling: we sample uniformly within each bin
+        # For bin (θ_bin, φ_bin): p(ω_i) = 1/(ΔΩ_bin) for ω_i in that bin
+        # where ΔΩ_bin = solid angle of the bin
+        # So we need to multiply by ΔΩ_bin
+        # We'll approximate by using the average solid angle of the bin
+        bin_solid_angles = np.zeros((theta_bins//2, phi_bins))
+        theta_edges = np.linspace(0, np.pi/2, theta_bins//2 + 1)
+        phi_edges = np.linspace(0, 2*np.pi, phi_bins + 1)
+        for i in range(theta_bins//2):
+            for j in range(phi_bins):
+                delta_cos = np.cos(theta_edges[i]) - np.cos(theta_edges[i+1])
+                delta_phi = phi_edges[j+1] - phi_edges[j]
+                bin_solid_angles[i, j] = delta_cos * delta_phi
+        histogram = histogram * mi.TensorXf(bin_solid_angles)[:, :, None, None, None]
+    else:
+        raise ValueError(f"Unknown sampling method: {sampling_method}")
+    
+    # Divide by outgoing solid angle to get radiance per unit solid angle
     histogram = histogram / mi.TensorXf(solid_angles)[None, None, :, :, None]
+    
     histogram = dr.select(dr.isnan(histogram) | dr.isinf(histogram), 0.0, histogram)
 
     return histogram, histogram_count
@@ -247,19 +282,8 @@ def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360
 # Top-level RDM collection
 # ─────────────────────────────────────────────
 
-def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
-                 theta_bins=180, phi_bins=360, max_depth=4096):
-    """
-    Fire `num_samples` rays inward from random directions on a sphere that
-    safely encloses the diamond, trace them through the dielectric, and
-    bin the result into transmittance / reflectance / multiple-scatter
-    histograms.
-    """
-    # Origins on a sphere of radius >> bounding_radius, aimed at the
-    # origin -- comfortably outside the stone so rays start in free space,
-    # not touching the girdle.
-    origin_radius = 3.0 * bounding_radius
-
+def sample_directions_uniform_on_sphere(num_samples):
+    """Sample directions uniformly on the sphere (current method)."""
     if _HAS_TORCH:
         dirs = torch.randn(num_samples, 3, device=device)
         dirs /= torch.norm(dirs, dim=-1, keepdim=True)
@@ -267,6 +291,108 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
     else:
         dirs_np = np.random.randn(num_samples, 3)
         dirs_np /= np.linalg.norm(dirs_np, axis=-1, keepdims=True)
+    return dirs_np
+
+def sample_directions_uniform_in_cos_theta(num_samples):
+    """
+    Sample directions with uniform distribution in cos(θ).
+    This gives more samples near grazing angles to compensate for smaller solid angles.
+    
+    For uniform sampling in cos(θ):
+    - Sample u1, u2 uniformly in [0, 1]
+    - θ = acos(1 - 2*u1)  [gives uniform cos(θ) in [-1, 1]]
+    - φ = 2π * u2
+    - x = sin(θ)cos(φ), y = sin(θ)sin(φ), z = cos(θ)
+    """
+    if _HAS_TORCH:
+        u1 = torch.rand(num_samples, device=device)
+        u2 = torch.rand(num_samples, device=device)
+        theta = torch.acos(1 - 2 * u1)
+        phi = 2 * torch.pi * u2
+        x = torch.sin(theta) * torch.cos(phi)
+        y = torch.sin(theta) * torch.sin(phi)
+        z = torch.cos(theta)
+        dirs = torch.stack([x, y, z], dim=-1)
+        dirs_np = dirs.cpu().numpy()
+    else:
+        u1 = np.random.rand(num_samples)
+        u2 = np.random.rand(num_samples)
+        theta = np.arccos(1 - 2 * u1)
+        phi = 2 * np.pi * u2
+        x = np.sin(theta) * np.cos(phi)
+        y = np.sin(theta) * np.sin(phi)
+        z = np.cos(theta)
+        dirs_np = np.stack([x, y, z], axis=-1)
+    return dirs_np
+
+def sample_directions_stratified(num_samples, theta_bins=8, phi_bins=16):
+    """
+    Stratified sampling to ensure all direction bins get some samples.
+    Samples are distributed evenly across θ_i bins (0-90°) and φ bins.
+    """
+    samples_per_bin = max(1, num_samples // (theta_bins * phi_bins))
+    total_samples = samples_per_bin * theta_bins * phi_bins
+    
+    dirs_list = []
+    for theta_idx in range(theta_bins):
+        for phi_idx in range(phi_bins):
+            # Sample within this bin
+            theta_start = (theta_idx / theta_bins) * (np.pi / 2)
+            theta_end = ((theta_idx + 1) / theta_bins) * (np.pi / 2)
+            phi_start = (phi_idx / phi_bins) * 2 * np.pi
+            phi_end = ((phi_idx + 1) / phi_bins) * 2 * np.pi
+            
+            # Use uniform in cos(θ) within the bin for better grazing angle coverage
+            u1 = np.random.rand(samples_per_bin)
+            u2 = np.random.rand(samples_per_bin)
+            
+            # Transform to uniform in cos(θ) within bin limits
+            cos_theta_start = np.cos(theta_end)  # Note: cos is decreasing function
+            cos_theta_end = np.cos(theta_start)
+            cos_theta = cos_theta_start + (cos_theta_end - cos_theta_start) * u1
+            theta = np.arccos(np.clip(cos_theta, -1.0, 1.0))
+            phi = phi_start + (phi_end - phi_start) * u2
+            
+            x = np.sin(theta) * np.cos(phi)
+            y = np.sin(theta) * np.sin(phi)
+            z = np.cos(theta)
+            
+            dirs_list.append(np.stack([x, y, z], axis=-1))
+    
+    dirs_np = np.concatenate(dirs_list, axis=0)
+    # If we have extra capacity, add some uniform samples
+    if total_samples < num_samples:
+        extra = sample_directions_uniform_in_cos_theta(num_samples - total_samples)
+        dirs_np = np.concatenate([dirs_np, extra], axis=0)
+    
+    return dirs_np
+
+def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
+                 theta_bins=180, phi_bins=360, max_depth=4096,
+                 sampling_method='stratified'):
+    """
+    Fire `num_samples` rays inward from random directions on a sphere that
+    safely encloses the diamond, trace them through the dielectric, and
+    bin the result into transmittance / reflectance / multiple-scatter
+    histograms.
+    
+    sampling_method: 'uniform' (original), 'cos_theta', or 'stratified'
+    """
+    # Origins on a sphere of radius >> bounding_radius, aimed at the
+    # origin -- comfortably outside the stone so rays start in free space,
+    # not touching the girdle.
+    origin_radius = 3.0 * bounding_radius
+
+    # Choose sampling method
+    if sampling_method == 'uniform':
+        dirs_np = sample_directions_uniform_on_sphere(num_samples)
+    elif sampling_method == 'cos_theta':
+        dirs_np = sample_directions_uniform_in_cos_theta(num_samples)
+    elif sampling_method == 'stratified':
+        # For stratified sampling, use incoming direction bins (θ_i only goes to 90°)
+        dirs_np = sample_directions_stratified(num_samples, theta_bins=theta_bins//2, phi_bins=phi_bins)
+    else:
+        raise ValueError(f"Unknown sampling method: {sampling_method}")
 
     o = mi.Point3f(
         mi.Float(dirs_np[:, 0]) * origin_radius,
@@ -296,9 +422,9 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
     throughput_r = dr.select(select_r, throughput, 0.0)
     throughput_m = dr.select(select_m, throughput, 0.0)
 
-    rdm_t, count_t = compute_histogram_4d(wi, wo, throughput_t, theta_bins, phi_bins)
-    rdm_r, count_r = compute_histogram_4d(wi, wo, throughput_r, theta_bins, phi_bins)
-    rdm_m, count_m = compute_histogram_4d(wi, wo, throughput_m, theta_bins, phi_bins)
+    rdm_t, count_t = compute_histogram_4d(wi, wo, throughput_t, theta_bins, phi_bins, sampling_method)
+    rdm_r, count_r = compute_histogram_4d(wi, wo, throughput_r, theta_bins, phi_bins, sampling_method)
+    rdm_m, count_m = compute_histogram_4d(wi, wo, throughput_m, theta_bins, phi_bins, sampling_method)
 
     print(f"Total rays traced: {dr.width(wi)}")
    
@@ -317,6 +443,7 @@ def compute_rdm(
     num_batches=1024,
     batch_size=1024 * 8,
     diamond_kwargs=None,
+    sampling_method='stratified',
 ):
     """
     Accumulate the RDM over many batches of randomly-directed rays fired
@@ -331,7 +458,7 @@ def compute_rdm(
 
     for i in range(num_batches):
         rdm_t_, rdm_r_, rdm_m_, count_t_, count_r_, count_m_ = collect_rdm(
-            scene, bounding_radius, batch_size, theta_bins, phi_bins, max_depth,
+            scene, bounding_radius, batch_size, theta_bins, phi_bins, max_depth, sampling_method,
         )
 
         dr.eval(rdm_t_, rdm_r_, rdm_m_, count_t_, count_r_, count_m_)

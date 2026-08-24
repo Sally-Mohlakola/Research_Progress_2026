@@ -16,6 +16,8 @@ parser.add_argument("--theta_bins", type=int, help="Theta resolution of the RDM"
 parser.add_argument("--phi_bins", type=int, help="Phi resolution of the RDM", default=36)
 parser.add_argument("--max_depth", type=int, help="Max path bounces before Russian-roulette/truncation",
                      default=64)
+parser.add_argument("--sampling_method", type=str, help="Sampling method: uniform, cos_theta, or stratified",
+                     default="stratified", choices=["uniform", "cos_theta", "stratified"])
 
 args = parser.parse_args()
 
@@ -31,6 +33,7 @@ rdm_t, rdm_r, rdm_m, count_t, count_r, count_m, x, sa = compute_rdm(
     num_batches=args.num_batches,
     batch_size=args.batch_size,
     diamond_kwargs=diamond_kwargs,
+    sampling_method=args.sampling_method,
 )
 
 rdm_t, rdm_r, rdm_m, count_t, count_r, count_m, x, sa = [

@@ -158,8 +158,6 @@ def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0):
     props['int_ior'] = diamond_params['int_ior']
     props['ext_ior'] = diamond_params['ext_ior']
     props['type'] = 'neural_diamond'
-    props['use_physics_fallback'] = True  # Enable physics fallback for untrained directions
-    props['confidence_threshold'] = 0.05  # Threshold for blending to physics
     
     bsdf = NeuralDiamond(props)
     bsdf.model_m = mlp_m

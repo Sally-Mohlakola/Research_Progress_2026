@@ -39,44 +39,12 @@ class NeuralDiamond(mi.BSDF):
         self.model_t = None  # Transmittance fraction: f(wi) -> [0,1]
         self.rdm_sampler = None  # RDM direction sampler
         
-        # Fallback parameters
-        self.use_physics_fallback = props.get('use_physics_fallback', True)
-        self.confidence_threshold = props.get('confidence_threshold', 0.01)  # Min value to trust neural output
-        
         # Glossy flags - we're sampling from learned distribution
         # Not delta because directions come from RDM (continuous)
         self.m_flags = (mi.BSDFFlags.GlossyReflection | 
                         mi.BSDFFlags.GlossyTransmission |
                         mi.BSDFFlags.FrontSide | mi.BSDFFlags.BackSide)
         self.m_components = [self.m_flags, self.m_flags]
-    
-    # ------------------------------------------------------------------
-    # Physics-based fallback for untrained directions
-    # ------------------------------------------------------------------
-    
-    def eval_analytic_dielectric(self, wi, wo):
-        """
-        Evaluate analytic dielectric BSDF for fallback.
-        Returns approximate color for reflection/transmission.
-        """
-        cos_theta_i = mi.Frame3f.cos_theta(wi)
-        cos_theta_o = mi.Frame3f.cos_theta(wo)
-        
-        # Fresnel reflection coefficient
-        eta = self.int_ior / self.ext_ior
-        F, _, _, _ = mi.fresnel(dr.abs(cos_theta_i), eta)
-        
-        # Determine if this is reflection or transmission
-        same_side = (cos_theta_i * cos_theta_o) > 0
-        
-        # Reflection: Fresnel * white (diamond is colorless)
-        # Transmission: (1-Fresnel) * white
-        value = dr.select(same_side, F, 1.0 - F)
-        
-        # Scale by geometric term (simplified)
-        value = value * dr.abs(cos_theta_o)
-        
-        return mi.Color3f(value, value, value)
     
     # ------------------------------------------------------------------
     # Neural model evaluation
@@ -183,57 +151,39 @@ class NeuralDiamond(mi.BSDF):
     
     def sample(self, ctx, si, sample1, sample2, active):
         """
-        Fully neural sampling with physics-based fallback.
+        Fully neural sampling.
         
-        1. Model_T predicts transmittance (R/T ratio) or use Fresnel
-        2. RDM sampler gives outgoing direction or use hemisphere
-        3. Model_M predicts color for (wi, wo) or use analytic
+        1. Model_T predicts transmittance (R/T ratio)
+        2. RDM sampler gives outgoing direction
+        3. Model_M predicts color for (wi, wo)
         """
         bs = mi.BSDFSample3f()
         
-        # 1. Get transmittance - use Fresnel as fallback
-        if self.model_t is not None:
-            p_t = self.eval_model_t(si.wi)
-        else:
-            cos_theta = mi.Frame3f.cos_theta(si.wi)
-            eta = self.int_ior / self.ext_ior
-            F, _, _, _ = mi.fresnel(cos_theta, eta)
-            p_t = 1.0 - F  # Transmittance
-        
+        # 1. Get transmittance from Model_T (NEURAL)
+        p_t = self.eval_model_t(si.wi)
         p_r = 1.0 - p_t  # Reflectance
         
-        # 2. Sample direction from RDM or uniform hemisphere
+        # 2. Sample direction from RDM (NEURAL)
         wo, pdf = self.sample_from_rdm(si.wi, sample1, sample2)
         bs.wo = wo
         bs.pdf = pdf
         bs.eta = mi.Float(1.0)
         
-        # 3. Get color - try neural first, fallback to analytic if low confidence
-        if self.model_m is not None:
-            color = self.eval_model_m(si.wi, wo)
-            color = dr.clamp(color, 0.0, 100.0)
-            
-            # Check confidence
-            if self.use_physics_fallback:
-                neural_magnitude = dr.norm(color)
-                use_fallback = neural_magnitude < self.confidence_threshold
-                
-                if dr.any(use_fallback):
-                    analytic_color = self.eval_analytic_dielectric(si.wi, wo)
-                    blend_factor = dr.clamp(neural_magnitude / self.confidence_threshold, 0.0, 1.0)
-                    color = analytic_color * (1.0 - blend_factor) + color * blend_factor
-        else:
-            # Pure analytic fallback
-            color = self.eval_analytic_dielectric(si.wi, wo)
+        # 3. Get color from Model_M (NEURAL)
+        color = self.eval_model_m(si.wi, wo)
+        color = dr.clamp(color, 0.0, 100.0)  # Allow bright diamond fire
         
         # 4. Combine: color * (reflectance or transmittance)
         # Use Model_T to weight reflection vs transmission
+        # This ensures energy conservation
         energy = dr.select(wo.z > 0, p_r, p_t)  # Upward = reflection, downward = transmission
         value = color * energy
         
         # Set BSDF flags based on direction
         bs.sampled_component = mi.UInt32(0)
         bs.sampled_type = mi.UInt32(+mi.BSDFFlags.GlossyReflection)
+        #if wo.z < 0:
+            #bs.sampled_type = mi.UInt32(+mi.BSDFFlags.GlossyTransmission)
         
         # Weight = value / pdf (standard for Monte Carlo)
         safe_pdf = dr.maximum(pdf, 1e-6)
@@ -245,39 +195,21 @@ class NeuralDiamond(mi.BSDF):
         """
         Evaluate BSDF for given directions.
         
-        Returns Model_M output for any (wi, wo), with physics-based
-        fallback for untrained directions (where neural output is near-zero).
+        Returns Model_M output for any (wi, wo).
         """
         if self.model_m is None:
-            # No neural model, use pure analytic
-            return self.eval_analytic_dielectric(si.wi, wo)
+            return mi.Color3f(0.0)
         
         # Get neural color
-        neural_value = self.eval_model_m(si.wi, wo)
-        neural_value = dr.clamp(neural_value, 0.0, 100.0)
+        value = self.eval_model_m(si.wi, wo)
+        value = dr.clamp(value, 0.0, 100.0)
         
         # Modulate by Model_T if available
         if self.model_t is not None:
             p_t = self.eval_model_t(si.wi)
             # If wo points upward, it's reflection; downward = transmission
             energy = dr.select(wo.z > 0, 1.0 - p_t, p_t)
-            neural_value = neural_value * energy
-        
-        # Fallback to physics-based BSDF for low-confidence predictions
-        if self.use_physics_fallback:
-            neural_magnitude = dr.norm(neural_value)
-            use_fallback = neural_magnitude < self.confidence_threshold
-            
-            if dr.any(use_fallback):
-                analytic_value = self.eval_analytic_dielectric(si.wi, wo)
-                # Blend: use analytic when neural is too low
-                # For smooth transition, blend between analytic and neural
-                blend_factor = dr.clamp(neural_magnitude / self.confidence_threshold, 0.0, 1.0)
-                value = analytic_value * (1.0 - blend_factor) + neural_value * blend_factor
-            else:
-                value = neural_value
-        else:
-            value = neural_value
+            value = value * energy
         
         return dr.select(active, dr.maximum(value, 0.0), mi.Color3f(0.0))
     

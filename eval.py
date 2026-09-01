@@ -40,6 +40,7 @@ mi.set_variant(variant)
 from mitsuba import ScalarTransform4f as sT
 
 from bsdf.analytic_bsdf import DiamondShading
+from bsdf.rdm_sampler import build_rdm_sampler
 from neural.base_model import Model_M, Model_T
 from neural.drjit_wrapper import MiModelWrapper
 
@@ -161,7 +162,44 @@ def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0):
     
     bsdf = NeuralDiamond(props)
     bsdf.model_m = mlp_m
-    
+
+    # Load Model_T (transmittance fraction). Without this, eval_model_t()
+    # silently falls back to plain analytic Fresnel every time it's called.
+    model_t_path = os.path.join(checkpoint_dir, 'model_t.pth')
+    if os.path.exists(model_t_path):
+        model_t = Model_T().to(device)
+        try:
+            model_t.load_state_dict(
+                torch.load(model_t_path, map_location=device, weights_only=False)
+            )
+            model_t.eval()
+            mlp_t = WrapperWithSkip(model_t, lambda x: dr.clamp(x, 0.0, 1.0))
+            bsdf.model_t = mlp_t
+            print("✓ Model_T weights loaded")
+        except RuntimeError as e:
+            # Most common cause: the checkpoint was trained against a
+            # different Model_T architecture than the one currently defined
+            # in neural/base_model.py (e.g. a 3-channel output vs. today's
+            # 1-channel scalar transmittance) -- a shape mismatch, not a
+            # missing-file problem. Don't let it take down the whole render;
+            # fall back to analytic Fresnel and say exactly why.
+            print(f"  ⚠ Model_T checkpoint at {model_t_path} doesn't match "
+                  f"the current Model_T architecture ({e}). "
+                  f"Falling back to analytic Fresnel for R/T ratio -- "
+                  f"retrain Model_T or point checkpoint_name at a run "
+                  f"produced with the current architecture to fix this.")
+    else:
+        print(f"  ⚠ Model_T not found at {model_t_path} -- "
+              f"falling back to analytic Fresnel for R/T ratio")
+
+    # Build and attach the RDM alias sampler. Without this, sample_from_rdm()
+    # silently falls back to uniform-hemisphere direction sampling, which is
+    # a massive importance-sampling mismatch against Model_M's actual
+    # (peaked, facet-dependent) output distribution -- that mismatch is what
+    # was producing the per-facet noise in the renders.
+    rdm_sampler = build_rdm_sampler(checkpoint_dir)
+    bsdf.rdm_sampler = rdm_sampler
+
     # Add a clamp to the BSDF output
     def safe_eval(bsdf, *args, **kwargs):
         result = bsdf.__class__.eval(bsdf, *args, **kwargs)
@@ -171,7 +209,7 @@ def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0):
     # Monkey patch eval for safety
     bsdf.eval = safe_eval.__get__(bsdf, NeuralDiamond)
     
-    print("✓ NeuralDiamond BSDF ready with numerical stability")
+    print(f"✓ NeuralDiamond BSDF ready: {bsdf.to_string()}")
     return bsdf
 
 

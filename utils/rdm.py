@@ -1,4 +1,3 @@
-
 from config import device, variant
 
 import mitsuba as mi
@@ -37,24 +36,7 @@ def ravel_index(indices, shape):
 
 
 def solid_angle_grid(polar, azimuth):
-    """
-    Per-bin solid angle dOmega = sin(theta) dtheta dphi, for a grid with
-    `polar` bins over the polar/colatitude angle theta in [0, pi] and
-    `azimuth` bins over the azimuthal angle phi in [0, 2*pi].
 
-    BUG FIX: this previously had the two ranges swapped (polar/theta
-    spanning [0, 2*pi] and azimuth/phi spanning [0, pi]). Once a theta
-    bin edge went past pi, cos(theta) started increasing again (cosine
-    is only monotonically decreasing on [0, pi]), which made
-    `cos(edges[i]) - cos(edges[i+1])` flip sign for the second half of
-    the grid -- producing a solid-angle grid with negative entries in
-    its bottom half. Any RDM histogram bin divided by one of those
-    negative entries (`histogram / solid_angles`) silently flipped sign,
-    which is exactly how a strictly non-negative quantity (radiometric
-    energy) ended up negative in rdm_m for theta_o > 90 degrees.
-    Verified: the corrected grid integrates to exactly 4*pi (the full
-    sphere's solid angle); the swapped version did not.
-    """
     polar_edges = np.linspace(0, np.pi, polar + 1)
     azimuth_edges = np.linspace(0, 2 * np.pi, azimuth + 1)
 
@@ -198,7 +180,24 @@ def trace_path(scene, rays, max_depth=10000):
 # 4D histogram accumulation
 # ─────────────────────────────────────────────
 
-def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360, sampling_method='uniform'):
+def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360):
+    """
+    Bin (omega_i, omega_o, throughput) samples into a 4D directional
+    histogram and normalize into radiance-per-solid-angle.
+
+    IMPORTANT: the per-bin mean computed below (sum of throughput in a
+    bin / count of samples that landed in that bin) is *already* an
+    unbiased Monte-Carlo estimate of E[throughput | omega_i in bin],
+    regardless of how omega_i was sampled (uniform on the sphere,
+    cosine-weighted, stratified, whatever). The sampling scheme only
+    affects the *variance* of that estimate, not its expectation, so
+    there must be no additional PDF re-weighting here. A previous
+    version of this function re-divided by a sampling-method-dependent
+    PDF on top of the per-bin mean, which made the output scale change
+    depending on which sampler was used to generate the input rays --
+    that was a bug (double correction), not a physical effect. Do not
+    reintroduce it.
+    """
     theta_i = dr.acos(dr.clip(omega_i.z, -1.0, 1.0))
     phi_i = dr.atan2(omega_i.y, omega_i.x)
     theta_o = dr.acos(dr.clip(omega_o.z, -1.0, 1.0))
@@ -233,46 +232,18 @@ def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360
     dr.scatter_reduce(dr.ReduceOp.Add, count_i, mi.Float(1), count_idx, active=valid_mask)
 
     solid_angles, _, _ = solid_angle_grid(theta_bins, phi_bins)
-    
-    # Get solid angles for incoming directions (θ_i only goes to 90°)
-    solid_angles_incoming = solid_angles[:theta_bins//2, :]
 
     histogram = mi.TensorXf(s, shape)
     histogram_count = mi.TensorXf(count_i, count_i_shape)
-    
-    # Divide by count per incoming direction (average throughput per sample)
+
+    # Per-incoming-direction-bin mean throughput. This is the only
+    # normalization needed to turn accumulated sums into an unbiased
+    # estimate of E[throughput | omega_i] -- see docstring above.
     histogram = histogram / histogram_count[:, :, None, None, None]
-    
-    # Apply correction based on sampling method
-    if sampling_method == 'uniform':
-        # Uniform sphere sampling: p(ω_i) = solid_angle_incoming / (4π)
-        # Need to divide by p(ω_i) = multiply by 4π / solid_angle_incoming
-        histogram = histogram * (4.0 * np.pi) / mi.TensorXf(solid_angles_incoming)[:, :, None, None, None]
-    elif sampling_method == 'cos_theta':
-        # Uniform in cos(θ) sampling: p(ω_i) = 1/(2π) (independent of θ)
-        # PDF = 1/(2π) for all ω_i
-        histogram = histogram * (2.0 * np.pi)
-    elif sampling_method == 'stratified':
-        # Stratified sampling: we sample uniformly within each bin
-        # For bin (θ_bin, φ_bin): p(ω_i) = 1/(ΔΩ_bin) for ω_i in that bin
-        # where ΔΩ_bin = solid angle of the bin
-        # So we need to multiply by ΔΩ_bin
-        # We'll approximate by using the average solid angle of the bin
-        bin_solid_angles = np.zeros((theta_bins//2, phi_bins))
-        theta_edges = np.linspace(0, np.pi/2, theta_bins//2 + 1)
-        phi_edges = np.linspace(0, 2*np.pi, phi_bins + 1)
-        for i in range(theta_bins//2):
-            for j in range(phi_bins):
-                delta_cos = np.cos(theta_edges[i]) - np.cos(theta_edges[i+1])
-                delta_phi = phi_edges[j+1] - phi_edges[j]
-                bin_solid_angles[i, j] = delta_cos * delta_phi
-        histogram = histogram * mi.TensorXf(bin_solid_angles)[:, :, None, None, None]
-    else:
-        raise ValueError(f"Unknown sampling method: {sampling_method}")
-    
-    # Divide by outgoing solid angle to get radiance per unit solid angle
+
+    # Convert to radiance-per-unit-solid-angle in the outgoing direction.
     histogram = histogram / mi.TensorXf(solid_angles)[None, None, :, :, None]
-    
+
     histogram = dr.select(dr.isnan(histogram) | dr.isinf(histogram), 0.0, histogram)
 
     return histogram, histogram_count
@@ -297,7 +268,7 @@ def sample_directions_uniform_in_cos_theta(num_samples):
     """
     Sample directions with uniform distribution in cos(θ).
     This gives more samples near grazing angles to compensate for smaller solid angles.
-    
+
     For uniform sampling in cos(θ):
     - Sample u1, u2 uniformly in [0, 1]
     - θ = acos(1 - 2*u1)  [gives uniform cos(θ) in [-1, 1]]
@@ -332,7 +303,7 @@ def sample_directions_stratified(num_samples, theta_bins=8, phi_bins=16):
     """
     samples_per_bin = max(1, num_samples // (theta_bins * phi_bins))
     total_samples = samples_per_bin * theta_bins * phi_bins
-    
+
     dirs_list = []
     for theta_idx in range(theta_bins):
         for phi_idx in range(phi_bins):
@@ -341,30 +312,30 @@ def sample_directions_stratified(num_samples, theta_bins=8, phi_bins=16):
             theta_end = ((theta_idx + 1) / theta_bins) * (np.pi / 2)
             phi_start = (phi_idx / phi_bins) * 2 * np.pi
             phi_end = ((phi_idx + 1) / phi_bins) * 2 * np.pi
-            
+
             # Use uniform in cos(θ) within the bin for better grazing angle coverage
             u1 = np.random.rand(samples_per_bin)
             u2 = np.random.rand(samples_per_bin)
-            
+
             # Transform to uniform in cos(θ) within bin limits
             cos_theta_start = np.cos(theta_end)  # Note: cos is decreasing function
             cos_theta_end = np.cos(theta_start)
             cos_theta = cos_theta_start + (cos_theta_end - cos_theta_start) * u1
             theta = np.arccos(np.clip(cos_theta, -1.0, 1.0))
             phi = phi_start + (phi_end - phi_start) * u2
-            
+
             x = np.sin(theta) * np.cos(phi)
             y = np.sin(theta) * np.sin(phi)
             z = np.cos(theta)
-            
+
             dirs_list.append(np.stack([x, y, z], axis=-1))
-    
+
     dirs_np = np.concatenate(dirs_list, axis=0)
     # If we have extra capacity, add some uniform samples
     if total_samples < num_samples:
         extra = sample_directions_uniform_in_cos_theta(num_samples - total_samples)
         dirs_np = np.concatenate([dirs_np, extra], axis=0)
-    
+
     return dirs_np
 
 def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
@@ -375,8 +346,12 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
     safely encloses the diamond, trace them through the dielectric, and
     bin the result into transmittance / reflectance / multiple-scatter
     histograms.
-    
-    sampling_method: 'uniform' (original), 'cos_theta', or 'stratified'
+
+    sampling_method: 'uniform', 'cos_theta', or 'stratified' -- this only
+    controls how incoming directions are *chosen* (a variance-reduction /
+    coverage decision). It no longer feeds into any post-hoc histogram
+    correction; compute_histogram_4d's per-bin mean is already an
+    unbiased estimator regardless of which of these you use.
     """
     # Origins on a sphere of radius >> bounding_radius, aimed at the
     # origin -- comfortably outside the stone so rays start in free space,
@@ -414,26 +389,41 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
         print(f"  [warn] {not_escaped}/{num_samples} rays did not escape "
               f"within max_depth={max_depth} (trapped by total internal reflection)")
 
-    select_r = escaped & (depth == 1) & (dr.dot(wo, frame.n) > 0.0)
-    select_t = escaped & (depth == 1) & ~select_r
-    select_m = escaped & (depth >= 2)
+    # wo is already in the local shading frame (frame_first.to_local(...)),
+    # so its z-component *is* dot(wo_world, frame.n) -- comparing it against
+    # frame.n directly (as an earlier version did) mixed a local-space
+    # vector with a world-space normal, which is meaningless.
+    #
+    # Depth thresholds: a ray that escapes after depth==1 only ever reflected
+    # off the entry facet without entering the solid (a refracted ray can't
+    # escape a closed convex mesh after a single interaction -- it has to
+    # hit the mesh again to exit). So depth==2 is the direct "enter, then
+    # exit" transmission path, not multiple scattering; only depth>=3 means
+    # the ray bounced internally more than once before escaping.
+    select_r = escaped & (depth == 1) & (wo.z > 0.0)
+    select_t = escaped & (depth <= 2) & ~select_r
+    select_m = escaped & (depth >= 3)
 
     throughput_t = dr.select(select_t, throughput, 0.0)
     throughput_r = dr.select(select_r, throughput, 0.0)
     throughput_m = dr.select(select_m, throughput, 0.0)
 
-    rdm_t, count_t = compute_histogram_4d(wi, wo, throughput_t, theta_bins, phi_bins, sampling_method)
-    rdm_r, count_r = compute_histogram_4d(wi, wo, throughput_r, theta_bins, phi_bins, sampling_method)
-    rdm_m, count_m = compute_histogram_4d(wi, wo, throughput_m, theta_bins, phi_bins, sampling_method)
+    # theta_i/phi_i binning depends only on wi, and wi/wo pairing is shared
+    # across T/R/M, so the "count" (number of samples landing in each
+    # incoming-direction bin) is identical for all three -- compute it once
+    # instead of three times.
+    rdm_t, count_i = compute_histogram_4d(wi, wo, throughput_t, theta_bins, phi_bins)
+    rdm_r, _        = compute_histogram_4d(wi, wo, throughput_r, theta_bins, phi_bins)
+    rdm_m, _        = compute_histogram_4d(wi, wo, throughput_m, theta_bins, phi_bins)
 
     print(f"Total rays traced: {dr.width(wi)}")
-   
+
     print(f"Rays that escaped: {dr.count(escaped)}")
     print(f"Rays classified as T: {dr.count(select_t)}")
     print(f"Rays classified as R: {dr.count(select_r)}")
     print(f"Rays classified as M: {dr.count(select_m)}")
 
-    return rdm_t, rdm_r, rdm_m, count_t, count_r, count_m
+    return rdm_t, rdm_r, rdm_m, count_i, count_i, count_i
 
 
 def compute_rdm(
@@ -476,7 +466,12 @@ def compute_rdm(
             count_m += count_m_
 
         dr.eval(rdm_t, rdm_r, rdm_m, count_t, count_r, count_m)
-        dr.flush_malloc_cache()
+
+        # Flushing the malloc cache every batch is expensive at
+        # num_batches=1024; only do it periodically unless you're
+        # actually hitting memory pressure.
+        if i % 32 == 0:
+            dr.flush_malloc_cache()
 
         print(f"Batch {i + 1}/{num_batches}")
 
@@ -496,8 +491,5 @@ def compute_rdm(
     x = mi.TensorXf(x)
 
     solid_angles = mi.TensorXf(solid_angle_grid(theta_bins, phi_bins)[0])
-
-    # After trace_paths()
-
 
     return rdm_t, rdm_r, rdm_m, count_t, count_r, count_m, x, solid_angles

@@ -4,7 +4,7 @@ into an actual importance sampler over outgoing directions, indexed by
 incoming direction.
 
 This is what NeuralDiamond.sample_from_rdm()/pdf() expect as `self.rdm_sampler`:
-    sample_outgoing(theta_i, phi_i, u1, u2) -> theta_o, phi_o, pdf   (per-ray, drjit)
+    sample_outgoing(theta_i, phi_i, u1, u2, u3) -> theta_o, phi_o, pdf (per-ray, drjit)
     pdf_outgoing(theta_i, phi_i, theta_o, phi_o) -> pdf              (per-ray, drjit)
 
 Design: for each incoming-direction bin (theta_i, phi_i), the outgoing
@@ -48,7 +48,7 @@ def load_rdm_arrays(npz_path):
 
     rdm_t = pick("rdm_t")
     rdm_m = pick("rdm_m")
-    solid_angles = pick("solid_angles")
+    solid_angles = pick("solid_angles", "sa")
     count_i = pick("count_t", "count_i", "count_m")  # identical across T/R/M, see rdm.py
     return rdm_t, rdm_m, solid_angles, count_i
 
@@ -155,11 +155,19 @@ class RDMAliasSampler:
     # Public sampler interface (called from NeuralDiamond)
     # ------------------------------------------------------------------
 
-    def sample_outgoing(self, theta_i, phi_i, u1, u2):
+    def sample_outgoing(self, theta_i, phi_i, u1, u2, u3):
         """
         Per-ray alias-method sample of an outgoing direction, conditioned on
         the (binned) incoming direction. Returns bin-center theta_o, phi_o
         (jittered within the bin) and the *density* pdf for that direction.
+
+        Needs three independent variates, not two: u1 drives the alias
+        lookup, and u2/u3 jitter theta_o and phi_o *independently*. Driving
+        both jitters from the same variate (as a previous version did) put
+        every sample on the diagonal of its bin -- a 1-D line through a 2-D
+        cell -- while pdf_outgoing keeps reporting the density of the whole
+        uniformly-covered cell. That mismatch biases the estimator and
+        leaves structured gaps in the outgoing distribution.
         """
         ti_idx, pi_idx = self._incoming_bin(theta_i, phi_i)
         row = ti_idx * self.phi_i_bins + pi_idx
@@ -180,10 +188,11 @@ class RDMAliasSampler:
         po_idx = final_outcome % self.phi_o_bins
 
         # Jitter within the chosen bin so we don't only ever emit bin centers.
+        # u2 and u3 must be independent -- see the docstring.
         theta_o = self._bin_center(to_idx, self.theta_o_bins, 0.0, dr.pi) \
             + (u2 - 0.5) * (dr.pi / self.theta_o_bins)
         phi_o = self._bin_center(po_idx, self.phi_o_bins, -dr.pi, dr.pi) \
-            + (u2 - 0.5) * (dr.two_pi / self.phi_o_bins)
+            + (u3 - 0.5) * (dr.two_pi / self.phi_o_bins)
         theta_o = dr.clip(theta_o, 0.0, dr.pi)
 
         pdf = self._pdf_from_bins(ti_idx, pi_idx, to_idx, po_idx)
@@ -206,7 +215,7 @@ class RDMAliasSampler:
         return mass / solid_angle
 
 
-def build_rdm_sampler(checkpoint_dir, filename="rdm_data.npz", min_count=1.0):
+def build_rdm_sampler(checkpoint_dir, filename="rdm.npz", min_count=1.0):
     """
     Convenience loader: looks for `<checkpoint_dir>/<filename>`, builds and
     returns an RDMAliasSampler, or None (with a printed reason) if the file

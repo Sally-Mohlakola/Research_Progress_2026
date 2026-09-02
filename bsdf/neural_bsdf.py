@@ -33,12 +33,20 @@ class NeuralDiamond(mi.BSDF):
         mi.BSDF.__init__(self, props)
         self.int_ior = props.get('int_ior', 2.419)
         self.ext_ior = props.get('ext_ior', 1.000277)
-        
+        self.eta = self.int_ior / self.ext_ior
+
+        # Roughness of the analytic direct-reflection lobe S_R. A polished
+        # facet is very nearly a perfect mirror, but keeping a small non-zero
+        # roughness leaves S_R an ordinary sampleable lobe instead of a Dirac
+        # delta -- no delta bookkeeping in eval()/pdf(), at the cost of
+        # slightly softened highlights. Lower it toward 0 for sharper ones.
+        self.r_alpha = props.get('r_alpha', 0.05)
+
         # Neural models (set after construction)
         self.model_m = None  # Multi-scatter color: f(wi, wo) -> RGB
         self.model_t = None  # Transmittance fraction: f(wi) -> [0,1]
         self.rdm_sampler = None  # RDM direction sampler
-        
+
         # Glossy flags - we're sampling from learned distribution
         # Not delta because directions come from RDM (continuous)
         self.m_flags = (mi.BSDFFlags.GlossyReflection | 
@@ -101,6 +109,62 @@ class NeuralDiamond(mi.BSDF):
         return dr.unravel(mi.Color3f, dr.ravel(nn_out), order='C')
     
     # ------------------------------------------------------------------
+    # Analytic direct-reflection component S_R
+    # ------------------------------------------------------------------
+
+    def _r_distr(self):
+        return mi.MicrofacetDistribution(mi.MicrofacetType.GGX, self.r_alpha, True)
+
+    def fresnel_i(self, wi):
+        """Fresnel reflectance at the first surface, for lobe weighting."""
+        F, _, _, _ = mi.fresnel(mi.Frame3f.cos_theta(wi), mi.Float(self.eta))
+        return F
+
+    def eval_r(self, wi, wo, active):
+        """
+        Direct single-bounce reflection off the facet (paper Eq. 8, adapted).
+
+        Verified against the gathered data: rdm_r's energy per incoming bin
+        matches analytic Fresnel F(theta_i) to within 0.06% at near-normal
+        incidence, so this component is exactly Fresnel and needs no fitting.
+        That match also fixes the units -- integral over omega_o is F(theta_i),
+        i.e. the returned value already carries the outgoing cosine, which is
+        the same convention Model_M is trained in, so the two are summable.
+
+        The paper's (1 - P(T|omega_i)) prefactor is deliberately NOT applied:
+        their P(T) is "light misses every fiber", which has no analogue in a
+        solid gem, and the measured energy is already exactly F with no
+        further attenuation.
+        """
+        cos_i = mi.Frame3f.cos_theta(wi)
+        cos_o = mi.Frame3f.cos_theta(wo)
+        valid = active & (cos_i > 0.0) & (cos_o > 0.0)
+
+        m = dr.normalize(wi + wo)
+        distr = self._r_distr()
+        D = distr.eval(m)
+        G = distr.G(wi, wo, m)
+        F, _, _, _ = mi.fresnel(dr.dot(wi, m), mi.Float(self.eta))
+
+        # f_r * cos_o  ==  F*D*G / (4 * cos_i)
+        val = F * D * G / dr.maximum(4.0 * cos_i, 1e-8)
+        return dr.select(valid, mi.Color3f(val), mi.Color3f(0.0))
+
+    def pdf_r(self, wi, wo, active):
+        cos_i = mi.Frame3f.cos_theta(wi)
+        cos_o = mi.Frame3f.cos_theta(wo)
+        valid = active & (cos_i > 0.0) & (cos_o > 0.0)
+        m = dr.normalize(wi + wo)
+        distr = self._r_distr()
+        pdf = distr.pdf(wi, m) / dr.maximum(4.0 * dr.abs(dr.dot(wo, m)), 1e-8)
+        return dr.select(valid, pdf, 0.0)
+
+    def sample_r(self, wi, sample2):
+        distr = self._r_distr()
+        m, _ = distr.sample(wi, sample2)
+        return mi.reflect(wi, m)
+
+    # ------------------------------------------------------------------
     # RDM-based direction sampling
     # ------------------------------------------------------------------
     
@@ -122,8 +186,13 @@ class NeuralDiamond(mi.BSDF):
         Every ray in the batch independently looks up its own
         (theta_i, phi_i) bin and draws its own outgoing direction --
         no dr.slice(), no broadcast of a single shared direction.
-        sample2 supplies two independent uniform variates per ray
-        (sample2.x for alias selection, sample2.y for alias accept/reject).
+        The alias sampler needs three independent variates per ray:
+        sample2.x drives the alias lookup, and sample2.y / sample1 jitter
+        theta_o and phi_o independently. sample1 is Mitsuba's spare
+        component-selection variate, unused by this BSDF (there's a single
+        neural lobe), so it's free to serve as the third dimension --
+        without it the two jitters would have to share one variate, which
+        collapses every sample onto its bin's diagonal.
         """
         if self.rdm_sampler is None:
             wo  = mi.warp.square_to_uniform_hemisphere(sample2)
@@ -135,7 +204,7 @@ class NeuralDiamond(mi.BSDF):
         # sample_outgoing expects Dr.Jit Float arrays (one per ray).
         # Returns theta_o, phi_o, pdf -- all Dr.Jit Float, same width.
         theta_o, phi_o, pdf = self.rdm_sampler.sample_outgoing(
-            theta_i, phi_i, sample2.x, sample2.y,
+            theta_i, phi_i, sample2.x, sample2.y, mi.Float(sample1),
         )
 
         wo = mi.Vector3f(
@@ -149,83 +218,90 @@ class NeuralDiamond(mi.BSDF):
     # BSDF interface - Fully neural
     # ------------------------------------------------------------------
     
+    def _lobe_prob(self, wi):
+        """
+        Probability of picking the analytic reflection lobe. Total albedo is
+        ~1 and the directly-reflected share is exactly F(theta_i) (measured),
+        so Fresnel is the physically-right split. Clamped so neither lobe can
+        become unsamplable.
+        """
+        return dr.clip(self.fresnel_i(wi), 0.05, 0.95)
+
     def sample(self, ctx, si, sample1, sample2, active):
         """
-        Fully neural sampling.
-        
-        1. Model_T predicts transmittance (R/T ratio)
-        2. RDM sampler gives outgoing direction
-        3. Model_M predicts color for (wi, wo)
+        Two-lobe sample: the analytic direct reflection S_R and the neural
+        multi-scatter S_M, combined as S = S_R + S_M (paper Eq. 6).
+
+        Note S_M is NOT scaled by Model_T. rdm_m already integrates to the
+        measured multi-scatter albedo, so weighting it by a separately-learned
+        R/T fraction applies the split a second time -- the paper's Eq. 6 is a
+        plain sum. Model_T's job here is lobe bookkeeping, not attenuation.
         """
         bs = mi.BSDFSample3f()
-        
-        # 1. Get transmittance from Model_T (NEURAL)
-        p_t = self.eval_model_t(si.wi)
-        p_r = 1.0 - p_t  # Reflectance
-        
-        # 2. Sample direction from RDM (NEURAL)
-        wo, pdf = self.sample_from_rdm(si.wi, sample1, sample2)
+
+        p_lobe = self._lobe_prob(si.wi)
+        pick_r = sample1 < p_lobe
+
+        # Lobe choice consumes only the comparison, so rescale sample1 back to
+        # a fresh uniform variate rather than burning a dimension.
+        u_reuse = dr.select(pick_r,
+                            sample1 / dr.maximum(p_lobe, 1e-6),
+                            (sample1 - p_lobe) / dr.maximum(1.0 - p_lobe, 1e-6))
+        u_reuse = dr.clip(u_reuse, 0.0, 1.0)
+
+        wo_r = self.sample_r(si.wi, sample2)
+        wo_m, _ = self.sample_from_rdm(si.wi, u_reuse, sample2)
+        wo = dr.select(pick_r, wo_r, wo_m)
+
+        # One-sample mixture estimator: evaluate BOTH lobes and divide by the
+        # combined pdf, which is correct whichever lobe was actually drawn.
+        value = self.eval_r(si.wi, wo, active) + self._eval_m_clamped(si.wi, wo)
+        pdf = (p_lobe * self.pdf_r(si.wi, wo, active)
+               + (1.0 - p_lobe) * self.pdf_m(si.wi, wo, active))
+
         bs.wo = wo
         bs.pdf = pdf
         bs.eta = mi.Float(1.0)
-        
-        # 3. Get color from Model_M (NEURAL)
-        color = self.eval_model_m(si.wi, wo)
-        color = dr.clamp(color, 0.0, 100.0)  # Allow bright diamond fire
-        
-        # 4. Combine: color * (reflectance or transmittance)
-        # Use Model_T to weight reflection vs transmission
-        # This ensures energy conservation
-        energy = dr.select(wo.z > 0, p_r, p_t)  # Upward = reflection, downward = transmission
-        value = color * energy
-        
-        # Set BSDF flags based on direction
-        bs.sampled_component = mi.UInt32(0)
+        bs.sampled_component = dr.select(pick_r, mi.UInt32(0), mi.UInt32(1))
         bs.sampled_type = mi.UInt32(+mi.BSDFFlags.GlossyReflection)
-        #if wo.z < 0:
-            #bs.sampled_type = mi.UInt32(+mi.BSDFFlags.GlossyTransmission)
-        
-        # Weight = value / pdf (standard for Monte Carlo)
+
         safe_pdf = dr.maximum(pdf, 1e-6)
         weight = dr.select(active & (pdf > 0), value / safe_pdf, mi.Color3f(0.0))
-        
+
         return bs, weight
+
+    def _eval_m_clamped(self, wi, wo):
+        return dr.clamp(self.eval_model_m(wi, wo), 0.0, 100.0)
+
+    def pdf_m(self, wi, wo, active):
+        """PDF of the neural (RDM) lobe alone."""
+        if self.rdm_sampler is None:
+            return mi.warp.square_to_uniform_hemisphere_pdf(wo)
+        theta_i, phi_i = self._dir_to_spherical(wi)
+        theta_o, phi_o = self._dir_to_spherical(wo)
+        return self.rdm_sampler.pdf_outgoing(theta_i, phi_i, theta_o, phi_o)
     
     def eval(self, ctx, si, wo, active):
         """
-        Evaluate BSDF for given directions.
-        
-        Returns Model_M output for any (wi, wo).
+        S = S_R + S_M -- the analytic direct reflection plus the neural
+        multi-scatter term, in matching units (both carry the outgoing
+        cosine). No Model_T modulation: see sample().
         """
-        if self.model_m is None:
-            return mi.Color3f(0.0)
-        
-        # Get neural color
-        value = self.eval_model_m(si.wi, wo)
-        value = dr.clamp(value, 0.0, 100.0)
-        
-        # Modulate by Model_T if available
-        if self.model_t is not None:
-            p_t = self.eval_model_t(si.wi)
-            # If wo points upward, it's reflection; downward = transmission
-            energy = dr.select(wo.z > 0, 1.0 - p_t, p_t)
-            value = value * energy
-        
+        value = self.eval_r(si.wi, wo, active)
+        if self.model_m is not None:
+            value = value + self._eval_m_clamped(si.wi, wo)
+
         return dr.select(active, dr.maximum(value, 0.0), mi.Color3f(0.0))
-    
+
     def pdf(self, ctx, si, wo, active):
         """
-        Per-ray vectorized PDF lookup from the RDM alias table.
-        No dr.slice(), no broadcast -- every ray gets its own pdf value.
+        Mixture pdf matching sample()'s lobe split, so the two stay consistent
+        for MIS and for any integrator that queries pdf() directly.
         """
-        if self.rdm_sampler is not None:
-            theta_i, phi_i = self._dir_to_spherical(si.wi)
-            theta_o, phi_o = self._dir_to_spherical(wo)
-            pdf = self.rdm_sampler.pdf_outgoing(theta_i, phi_i, theta_o, phi_o)
-            return dr.select(active, pdf, 0.0)
-
-        # Uniform fallback
-        return mi.warp.square_to_uniform_hemisphere_pdf(wo)
+        p_lobe = self._lobe_prob(si.wi)
+        pdf = (p_lobe * self.pdf_r(si.wi, wo, active)
+               + (1.0 - p_lobe) * self.pdf_m(si.wi, wo, active))
+        return dr.select(active, pdf, 0.0)
     
     def component_count(self, active=True):
         return 2

@@ -53,8 +53,12 @@ def parse_args():
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--output_dir", type=str, default="rolling_animation")
-    parser.add_argument("--frames", type=int, default=60, help="Number of animation frames")
+    parser.add_argument("--frames", type=int, default=10, help="Number of animation frames")
     parser.add_argument("--exposure", type=float, default=1.0)
+    parser.add_argument("--r_alpha", type=float, default=0.05,
+                        help="Roughness of the analytic direct-reflection lobe S_R. "
+                             "Lower = sharper, brighter highlights (a real polished "
+                             "facet is near-perfectly smooth); GGX peak scales as 1/alpha^2.")
     parser.add_argument("--no_neural", action='store_true',
                         help="Use analytic dielectric only (ground truth reference)")
     parser.add_argument("--fps", type=int, default=30, help="Video frames per second")
@@ -113,7 +117,7 @@ def build_diamond_mesh(diamond_params):
     return tmp.name, fv, fn, ff
 
 
-def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0):
+def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0, r_alpha=0.05):
     """Load neural BSDF with numerical stability."""
     
     model_m = Model_M().to(device)
@@ -159,7 +163,8 @@ def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0):
     props['int_ior'] = diamond_params['int_ior']
     props['ext_ior'] = diamond_params['ext_ior']
     props['type'] = 'neural_diamond'
-    
+    props['r_alpha'] = r_alpha
+
     bsdf = NeuralDiamond(props)
     bsdf.model_m = mlp_m
 
@@ -640,7 +645,7 @@ def main():
         bsdf = load_analytic_bsdf(diamond_params)
     else:
         print("✓ Mode: neural shading (Model_M + DiamondFacet)")
-        bsdf = load_neural_bsdf_direct(checkpoint_dir, diamond_params, args.clamp_value)
+        bsdf = load_neural_bsdf_direct(checkpoint_dir, diamond_params, args.clamp_value, args.r_alpha)
         if bsdf is None:
             print("⚠ Neural BSDF failed to load - falling back to dielectric")
             bsdf = load_analytic_bsdf(diamond_params)

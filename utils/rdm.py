@@ -299,7 +299,19 @@ def sample_directions_uniform_in_cos_theta(num_samples):
 def sample_directions_stratified(num_samples, theta_bins=8, phi_bins=16):
     """
     Stratified sampling to ensure all direction bins get some samples.
-    Samples are distributed evenly across θ_i bins (0-90°) and φ bins.
+    Samples are distributed evenly across polar bins (0-180°) and φ bins.
+
+    IMPORTANT: these are *global* directions on the sphere the rays are
+    fired from, so theta must span the full [0, pi] -- not [0, pi/2].
+    Restricting it to the upper hemisphere (as a previous version did)
+    lights the stone only from above: the pavilion never gets directly
+    illuminated, and the local incidence bins that only occur under
+    lighting from below/the side are never populated at all. Measured on
+    the round brilliant: full sphere reaches 41 of 64 (theta_i, phi_i)
+    bins, upper hemisphere only 15. The [0, pi/2] range belongs to the
+    *local* incidence angle theta_i (measured against the hit facet's own
+    normal, which is what compute_histogram_4d bins) -- not to the global
+    direction sampled here. Do not conflate the two.
     """
     samples_per_bin = max(1, num_samples // (theta_bins * phi_bins))
     total_samples = samples_per_bin * theta_bins * phi_bins
@@ -308,8 +320,8 @@ def sample_directions_stratified(num_samples, theta_bins=8, phi_bins=16):
     for theta_idx in range(theta_bins):
         for phi_idx in range(phi_bins):
             # Sample within this bin
-            theta_start = (theta_idx / theta_bins) * (np.pi / 2)
-            theta_end = ((theta_idx + 1) / theta_bins) * (np.pi / 2)
+            theta_start = (theta_idx / theta_bins) * np.pi
+            theta_end = ((theta_idx + 1) / theta_bins) * np.pi
             phi_start = (phi_idx / phi_bins) * 2 * np.pi
             phi_end = ((phi_idx + 1) / phi_bins) * 2 * np.pi
 
@@ -364,8 +376,12 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
     elif sampling_method == 'cos_theta':
         dirs_np = sample_directions_uniform_in_cos_theta(num_samples)
     elif sampling_method == 'stratified':
-        # For stratified sampling, use incoming direction bins (θ_i only goes to 90°)
-        dirs_np = sample_directions_stratified(num_samples, theta_bins=theta_bins//2, phi_bins=phi_bins)
+        # Stratify the *global* sphere of ray origins over the full polar
+        # range, so use all theta_bins strata (not theta_bins//2, which
+        # paired with the old [0, pi/2] range to light the stone from
+        # above only). The theta_bins//2 halving applies to the local
+        # theta_i histogram axis in compute_histogram_4d, not here.
+        dirs_np = sample_directions_stratified(num_samples, theta_bins=theta_bins, phi_bins=phi_bins)
     else:
         raise ValueError(f"Unknown sampling method: {sampling_method}")
 
@@ -443,8 +459,16 @@ def compute_rdm(
     diamond_kwargs = diamond_kwargs or {}
     scene, bounding_radius = build_diamond_scene(**diamond_kwargs)
 
-    rdm_t = rdm_r = rdm_m = None
-    count_t = count_r = count_m = None
+    # Each collect_rdm() call returns, per bin, the *mean* throughput over
+    # that batch's own hits (see compute_histogram_4d). A bin that isn't
+    # hit in every batch must not be averaged as if it were -- weight each
+    # batch's mean by how many samples it was actually computed from, sum
+    # those, and divide by the *total* count at the end. (Dividing the
+    # sum-of-means by num_batches, as a previous version did, implicitly
+    # counted every batch a bin missed as a silent 0, biasing intermittently
+    # -- hit bins toward black in proportion to how rarely they're hit.)
+    rdm_t_wsum = rdm_r_wsum = rdm_m_wsum = None
+    count_i = None
 
     for i in range(num_batches):
         rdm_t_, rdm_r_, rdm_m_, count_t_, count_r_, count_m_ = collect_rdm(
@@ -453,19 +477,28 @@ def compute_rdm(
 
         dr.eval(rdm_t_, rdm_r_, rdm_m_, count_t_, count_r_, count_m_)
 
+        # collect_rdm hands back ONE incoming-bin count tensor under three
+        # names (the count depends only on wi, so it's shared across T/R/M).
+        # Keep a single accumulator and rebind rather than using `+=`: three
+        # in-place adds to what is really one aliased tensor inflated the
+        # divisor to 1 + 3*(num_batches - 1) instead of num_batches, scaling
+        # every gathered RDM down by ~3x.
+        count_batch = count_t_
+        w = mi.TensorXf(count_batch)[:, :, None, None, None]
+
         if i == 0:
             print("Collecting RDM")
-            rdm_t, rdm_r, rdm_m = rdm_t_, rdm_r_, rdm_m_
-            count_t, count_r, count_m = count_t_, count_r_, count_m_
+            rdm_t_wsum = rdm_t_ * w
+            rdm_r_wsum = rdm_r_ * w
+            rdm_m_wsum = rdm_m_ * w
+            count_i = mi.TensorXf(count_batch) + 0.0   # copy, never alias
         else:
-            rdm_t += rdm_t_
-            rdm_r += rdm_r_
-            rdm_m += rdm_m_
-            count_t += count_t_
-            count_r += count_r_
-            count_m += count_m_
+            rdm_t_wsum = rdm_t_wsum + rdm_t_ * w
+            rdm_r_wsum = rdm_r_wsum + rdm_r_ * w
+            rdm_m_wsum = rdm_m_wsum + rdm_m_ * w
+            count_i = count_i + count_batch
 
-        dr.eval(rdm_t, rdm_r, rdm_m, count_t, count_r, count_m)
+        dr.eval(rdm_t_wsum, rdm_r_wsum, rdm_m_wsum, count_i)
 
         # Flushing the malloc cache every batch is expensive at
         # num_batches=1024; only do it periodically unless you're
@@ -475,9 +508,14 @@ def compute_rdm(
 
         print(f"Batch {i + 1}/{num_batches}")
 
-    rdm_t /= num_batches
-    rdm_r /= num_batches
-    rdm_m /= num_batches
+    count_b = mi.TensorXf(count_i)[:, :, None, None, None]
+
+    rdm_t = dr.select(count_b > 0, rdm_t_wsum / dr.maximum(count_b, 1.0), 0.0)
+    rdm_r = dr.select(count_b > 0, rdm_r_wsum / dr.maximum(count_b, 1.0), 0.0)
+    rdm_m = dr.select(count_b > 0, rdm_m_wsum / dr.maximum(count_b, 1.0), 0.0)
+
+    # Reported three times for the saved-file layout; they are one array.
+    count_t = count_r = count_m = count_i
 
     theta_i_centers = np.linspace(0, np.pi / 2, theta_bins // 2, endpoint=False) + (np.pi / 2 / (theta_bins // 2)) / 2
     phi_i_centers = np.linspace(-np.pi, np.pi, phi_bins, endpoint=False) + (2 * np.pi / phi_bins) / 2

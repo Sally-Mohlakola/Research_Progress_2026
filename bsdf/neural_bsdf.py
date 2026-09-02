@@ -17,7 +17,14 @@ import mitsuba as mi
 import drjit as dr
 from config import device, variant
 
-mi.set_variant(variant)
+# Respect a variant the caller has already chosen (e.g. a scalar_spectral
+# test harness) instead of forcing the configured one.
+if mi.variant() is None:
+    mi.set_variant(variant)
+
+from bsdf.dispersion import (
+    IS_SPECTRAL, REFERENCE_IOR, fresnel_spectral, hero_eta, rgb_to_spectrum,
+)
 
 
 class NeuralDiamond(mi.BSDF):
@@ -31,9 +38,16 @@ class NeuralDiamond(mi.BSDF):
     
     def __init__(self, props):
         mi.BSDF.__init__(self, props)
-        self.int_ior = props.get('int_ior', 2.419)
+        self.int_ior = props.get('int_ior', REFERENCE_IOR)
         self.ext_ior = props.get('ext_ior', 1.000277)
         self.eta = self.int_ior / self.ext_ior
+
+        # Wavelength-dependent IOR for the analytic reflection lobe. Only S_R
+        # can disperse: the neural S_M is fitted to an RDM with no wavelength
+        # axis, so it returns the same spectrum whatever wavelength a ray
+        # carries. Fire in the neural term needs that axis added to the
+        # gather -- see FACET_CONDITIONED_BSDF.md.
+        self.dispersion = bool(props.get('dispersion', True))
 
         # Roughness of the analytic direct-reflection lobe S_R. A polished
         # facet is very nearly a perfect mirror, but keeping a small non-zero
@@ -96,17 +110,22 @@ class NeuralDiamond(mi.BSDF):
         # Clamp to valid range
         return dr.clamp(t_raw, 0.0, 1.0)
     
-    def eval_model_m(self, wi, wo):
+    def eval_model_m(self, si, wo):
         """
-        Evaluate multi-scatter color model.
-        Returns RGB color for any (wi, wo).
+        Evaluate multi-scatter colour model.
+
+        The network emits three numbers; under a spectral variant those are
+        treated as an sRGB colour and upsampled to the ray's wavelengths.
+        Returns an UnpolarizedSpectrum either way, which is what a BSDF has
+        to hand back.
         """
         if self.model_m is None:
-            return mi.Color3f(0.0)
-        
-        nn_in = self._to_tensor(wi, wo)
+            return mi.UnpolarizedSpectrum(0.0)
+
+        nn_in = self._to_tensor(si.wi, wo)
         nn_out = self.model_m.forward(nn_in)
-        return dr.unravel(mi.Color3f, dr.ravel(nn_out), order='C')
+        rgb = dr.unravel(mi.Color3f, dr.ravel(nn_out), order='C')
+        return rgb_to_spectrum(rgb, si.wavelengths)
     
     # ------------------------------------------------------------------
     # Analytic direct-reflection component S_R
@@ -115,12 +134,21 @@ class NeuralDiamond(mi.BSDF):
     def _r_distr(self):
         return mi.MicrofacetDistribution(mi.MicrofacetType.GGX, self.r_alpha, True)
 
-    def fresnel_i(self, wi):
-        """Fresnel reflectance at the first surface, for lobe weighting."""
-        F, _, _, _ = mi.fresnel(mi.Frame3f.cos_theta(wi), mi.Float(self.eta))
+    def _eta(self, si):
+        """Relative IOR at this ray's hero wavelength."""
+        return hero_eta(si, self.int_ior, self.ext_ior, self.dispersion)
+
+    def fresnel_i(self, si):
+        """
+        Fresnel reflectance at the first surface, as a scalar, for lobe
+        weighting. The hero wavelength is enough here: this only picks which
+        lobe to sample, and any reasonable probability leaves the one-sample
+        mixture estimator unbiased.
+        """
+        F, _, _, _ = mi.fresnel(mi.Frame3f.cos_theta(si.wi), self._eta(si))
         return F
 
-    def eval_r(self, wi, wo, active):
+    def eval_r(self, si, wo, active):
         """
         Direct single-bounce reflection off the facet (paper Eq. 8, adapted).
 
@@ -136,6 +164,7 @@ class NeuralDiamond(mi.BSDF):
         solid gem, and the measured energy is already exactly F with no
         further attenuation.
         """
+        wi = si.wi
         cos_i = mi.Frame3f.cos_theta(wi)
         cos_o = mi.Frame3f.cos_theta(wo)
         valid = active & (cos_i > 0.0) & (cos_o > 0.0)
@@ -144,13 +173,19 @@ class NeuralDiamond(mi.BSDF):
         distr = self._r_distr()
         D = distr.eval(m)
         G = distr.G(wi, wo, m)
-        F, _, _, _ = mi.fresnel(dr.dot(wi, m), mi.Float(self.eta))
+
+        # Per-wavelength Fresnel. Reflection needs no hero collapse -- its
+        # direction is wavelength-independent -- so all channels stay live
+        # and simply carry slightly different reflectances.
+        F = fresnel_spectral(dr.dot(wi, m), si,
+                             self.int_ior, self.ext_ior, self.dispersion)
 
         # f_r * cos_o  ==  F*D*G / (4 * cos_i)
-        val = F * D * G / dr.maximum(4.0 * cos_i, 1e-8)
-        return dr.select(valid, mi.Color3f(val), mi.Color3f(0.0))
+        val = F * (D * G / dr.maximum(4.0 * cos_i, 1e-8))
+        return dr.select(valid, val, mi.UnpolarizedSpectrum(0.0))
 
-    def pdf_r(self, wi, wo, active):
+    def pdf_r(self, si, wo, active):
+        wi = si.wi
         cos_i = mi.Frame3f.cos_theta(wi)
         cos_o = mi.Frame3f.cos_theta(wo)
         valid = active & (cos_i > 0.0) & (cos_o > 0.0)
@@ -159,10 +194,10 @@ class NeuralDiamond(mi.BSDF):
         pdf = distr.pdf(wi, m) / dr.maximum(4.0 * dr.abs(dr.dot(wo, m)), 1e-8)
         return dr.select(valid, pdf, 0.0)
 
-    def sample_r(self, wi, sample2):
+    def sample_r(self, si, sample2):
         distr = self._r_distr()
-        m, _ = distr.sample(wi, sample2)
-        return mi.reflect(wi, m)
+        m, _ = distr.sample(si.wi, sample2)
+        return mi.reflect(si.wi, m)
 
     # ------------------------------------------------------------------
     # RDM-based direction sampling
@@ -218,14 +253,14 @@ class NeuralDiamond(mi.BSDF):
     # BSDF interface - Fully neural
     # ------------------------------------------------------------------
     
-    def _lobe_prob(self, wi):
+    def _lobe_prob(self, si):
         """
         Probability of picking the analytic reflection lobe. Total albedo is
         ~1 and the directly-reflected share is exactly F(theta_i) (measured),
         so Fresnel is the physically-right split. Clamped so neither lobe can
         become unsamplable.
         """
-        return dr.clip(self.fresnel_i(wi), 0.05, 0.95)
+        return dr.clip(self.fresnel_i(si), 0.05, 0.95)
 
     def sample(self, ctx, si, sample1, sample2, active):
         """
@@ -239,7 +274,7 @@ class NeuralDiamond(mi.BSDF):
         """
         bs = mi.BSDFSample3f()
 
-        p_lobe = self._lobe_prob(si.wi)
+        p_lobe = self._lobe_prob(si)
         pick_r = sample1 < p_lobe
 
         # Lobe choice consumes only the comparison, so rescale sample1 back to
@@ -249,14 +284,14 @@ class NeuralDiamond(mi.BSDF):
                             (sample1 - p_lobe) / dr.maximum(1.0 - p_lobe, 1e-6))
         u_reuse = dr.clip(u_reuse, 0.0, 1.0)
 
-        wo_r = self.sample_r(si.wi, sample2)
+        wo_r = self.sample_r(si, sample2)
         wo_m, _ = self.sample_from_rdm(si.wi, u_reuse, sample2)
         wo = dr.select(pick_r, wo_r, wo_m)
 
         # One-sample mixture estimator: evaluate BOTH lobes and divide by the
         # combined pdf, which is correct whichever lobe was actually drawn.
-        value = self.eval_r(si.wi, wo, active) + self._eval_m_clamped(si.wi, wo)
-        pdf = (p_lobe * self.pdf_r(si.wi, wo, active)
+        value = self.eval_r(si, wo, active) + self._eval_m_clamped(si, wo)
+        pdf = (p_lobe * self.pdf_r(si, wo, active)
                + (1.0 - p_lobe) * self.pdf_m(si.wi, wo, active))
 
         bs.wo = wo
@@ -266,12 +301,13 @@ class NeuralDiamond(mi.BSDF):
         bs.sampled_type = mi.UInt32(+mi.BSDFFlags.GlossyReflection)
 
         safe_pdf = dr.maximum(pdf, 1e-6)
-        weight = dr.select(active & (pdf > 0), value / safe_pdf, mi.Color3f(0.0))
+        weight = dr.select(active & (pdf > 0), value / safe_pdf,
+                           mi.UnpolarizedSpectrum(0.0))
 
         return bs, weight
 
-    def _eval_m_clamped(self, wi, wo):
-        return dr.clamp(self.eval_model_m(wi, wo), 0.0, 100.0)
+    def _eval_m_clamped(self, si, wo):
+        return dr.clamp(self.eval_model_m(si, wo), 0.0, 100.0)
 
     def pdf_m(self, wi, wo, active):
         """PDF of the neural (RDM) lobe alone."""
@@ -287,19 +323,20 @@ class NeuralDiamond(mi.BSDF):
         multi-scatter term, in matching units (both carry the outgoing
         cosine). No Model_T modulation: see sample().
         """
-        value = self.eval_r(si.wi, wo, active)
+        value = self.eval_r(si, wo, active)
         if self.model_m is not None:
-            value = value + self._eval_m_clamped(si.wi, wo)
+            value = value + self._eval_m_clamped(si, wo)
 
-        return dr.select(active, dr.maximum(value, 0.0), mi.Color3f(0.0))
+        return dr.select(active, dr.maximum(value, 0.0),
+                         mi.UnpolarizedSpectrum(0.0))
 
     def pdf(self, ctx, si, wo, active):
         """
         Mixture pdf matching sample()'s lobe split, so the two stay consistent
         for MIS and for any integrator that queries pdf() directly.
         """
-        p_lobe = self._lobe_prob(si.wi)
-        pdf = (p_lobe * self.pdf_r(si.wi, wo, active)
+        p_lobe = self._lobe_prob(si)
+        pdf = (p_lobe * self.pdf_r(si, wo, active)
                + (1.0 - p_lobe) * self.pdf_m(si.wi, wo, active))
         return dr.select(active, pdf, 0.0)
     
@@ -312,7 +349,7 @@ class NeuralDiamond(mi.BSDF):
         return self.m_components[index]
     
     def eval_attribute(self, name, si, active):
-        return mi.Color3f(0.0)
+        return mi.UnpolarizedSpectrum(0.0)
     
     def to_string(self):
         has_m = self.model_m is not None

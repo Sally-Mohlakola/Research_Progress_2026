@@ -29,7 +29,12 @@ import time
 sys.path.insert(0, os.path.dirname(__file__))
 from brilliant_geometry import make_round_brilliant, make_flat_shaded
 
-mi.set_variant("scalar_rgb")
+# Spectral rather than RGB: dispersion is what produces a diamond's fire,
+# and an RGB renderer has no wavelength axis to disperse along.
+mi.set_variant("scalar_spectral")
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from bsdf.dispersive_dielectric import DispersiveDielectric
 
 # ─────────────────────────────────────────────
 # 1. Geometry
@@ -65,9 +70,15 @@ mesh_params.update()
 # ─────────────────────────────────────────────
 
 diamond_bsdf = {
-    "type": "dielectric",
-    "int_ior": 2.419,     # diamond
+    # Dispersive: n varies with wavelength per the Sellmeier fit in
+    # bsdf/dispersion.py, so blue refracts more strongly than red and the
+    # stone throws coloured flashes. Mitsuba's stock `dielectric` takes a
+    # single scalar IOR and stays achromatic even under a spectral variant,
+    # so it cannot show fire; set "type" back to "dielectric" to see the
+    # difference.
+    "type": "dispersive_dielectric",
     "ext_ior": 1.000277,  # air
+    "dispersion": True,
 }
 mesh.set_bsdf(mi.load_dict(diamond_bsdf))
 

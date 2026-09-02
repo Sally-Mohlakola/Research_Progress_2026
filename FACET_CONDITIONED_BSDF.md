@@ -15,13 +15,19 @@ and fits small networks to the components.
 
 The port is numerically healthy. **[measured]** After fixing the batch-averaging and
 count-aliasing defects, total albedo is 1.0047 and `rdm_r` throughput per ray is 1.000,
-so energy is conserved and the gather is trustworthy.
+so the gather is energy-consistent. Note this is necessary but not sufficient: it says
+nothing about whether energy is distributed into the *right directions*.
 
 The renders are nevertheless wrong in a specific way: they are *flat*. The target
 appearance — the kaleidoscope, where facets are visible through other facets in sharp
-bright and dark wedges — is absent, and no amount of retraining has recovered it.
+bright and dark wedges — is absent, and retraining has not recovered it. (That last
+point is anecdotal as stated; the resolution sweep in `IMPLEMENTATION_PLAN.md` is what
+establishes it properly.)
 
-**[measured]** Linear-EXR statistics over the stone region:
+**[measured]** Linear-EXR statistics over the stone region. **These predate the
+geometry-mismatch fix** described in `IMPLEMENTATION_PLAN.md` §0 — the RDM was gathered
+on `round_diamond_gia` (culet_radius 0.02) and rendered on `round_brilliant_sharp_culet`
+(culet_radius 0.0) — so they must be regenerated on matched geometry before use:
 
 | render | median | mean | black px | p99/median |
 |---|---|---|---|---|
@@ -224,7 +230,18 @@ representational, not a performance result, and should not be dressed up as one.
    just between facets. Blocked: `ground_truth/brilliant_geometry.py:235` assigns the
    identical UV template `[[0,0],[1,0],[0,1]]` to every face, so UVs are degenerate and
    real ones must be generated first. Do not start here.
-7. **Two-point extension.** Is there a tractable middle ground between a BSDF and a full
+7. **Wavelength axis (fire).** The pipeline now runs on `llvm_ad_spectral`
+   with a dispersive dielectric, so the *path-traced* stone shows fire. The
+   neural `S_M` cannot: the RDM has no wavelength axis, so `Model_M` returns
+   the same spectrum whatever wavelength a ray carries, and dispersion in the
+   neural render comes only from the analytic `S_R` lobe (which barely
+   disperses, since reflection is wavelength-independent in direction).
+   Adding a wavelength axis to the gather is the same shape of change as
+   adding the facet axis, and the two compose: `[k, lambda, theta_i, phi_i,
+   theta_o, phi_o]`. Worth deciding whether fire is in scope before
+   committing to the extra axis, since it multiplies the data requirement
+   again.
+8. **Two-point extension.** Is there a tractable middle ground between a BSDF and a full
    BSSRDF — conditioning on entry facet *and* exit facet — that stays compatible with how
    Mitsuba invokes a BSDF? Probably not without a custom integrator, but worth ten minutes
    of thought before it is ruled out.

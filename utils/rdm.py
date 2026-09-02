@@ -2,7 +2,12 @@ from config import device, variant
 
 import mitsuba as mi
 import drjit as dr
-mi.set_variant(variant)
+# Respect a variant the caller has already chosen (e.g. a scalar_spectral
+# test harness) instead of forcing the configured one.
+if mi.variant() is None:
+    mi.set_variant(variant)
+
+from bsdf.dispersion import to_rgb3
 
 try:
     import torch
@@ -198,6 +203,14 @@ def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360
     that was a bug (double correction), not a physical effect. Do not
     reintroduce it.
     """
+    # Under a spectral variant `outputs` carries N wavelength samples rather
+    # than RGB, and reading .x/.y/.z off it would silently reinterpret three
+    # of the four wavelengths as colour channels. The gather scene uses an
+    # achromatic `dielectric`, so every channel holds the same throughput and
+    # this reduction is exact -- it is also the seam where a wavelength axis
+    # would be added to the RDM. See bsdf/dispersion.to_rgb3.
+    outputs = to_rgb3(outputs)
+
     theta_i = dr.acos(dr.clip(omega_i.z, -1.0, 1.0))
     phi_i = dr.atan2(omega_i.y, omega_i.x)
     theta_o = dr.acos(dr.clip(omega_o.z, -1.0, 1.0))

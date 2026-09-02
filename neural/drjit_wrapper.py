@@ -2,7 +2,10 @@ from config import device, variant
 
 import mitsuba as mi
 import drjit as dr
-mi.set_variant(variant)
+# Respect a variant the caller has already chosen (e.g. a scalar_spectral
+# test harness) instead of forcing the configured one.
+if mi.variant() is None:
+    mi.set_variant(variant)
 
 import torch
 import torch.nn as nn

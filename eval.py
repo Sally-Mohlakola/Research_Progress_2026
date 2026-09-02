@@ -40,6 +40,8 @@ mi.set_variant(variant)
 from mitsuba import ScalarTransform4f as sT
 
 from bsdf.analytic_bsdf import DiamondShading
+from bsdf.dispersive_dielectric import DispersiveDielectric
+from bsdf.dispersion import IS_SPECTRAL
 from bsdf.rdm_sampler import build_rdm_sampler
 from neural.base_model import Model_M, Model_T
 from neural.drjit_wrapper import MiModelWrapper
@@ -65,6 +67,10 @@ def parse_args():
     parser.add_argument("--orbit_radius", type=float, default=5.0, help="Camera orbit radius")
     parser.add_argument("--rotation_speed", type=float, default=1.0, help="Rotation speed multiplier")
     parser.add_argument("--clamp_value", type=float, default=10.0, help="Clamp neural BSDF output to this value")
+    parser.add_argument("--no_dispersion", action='store_true',
+                        help="Disable wavelength-dependent IOR. The control "
+                             "condition for any comparison about fire: "
+                             "everything else identical, dispersion off.")
     return parser.parse_args()
 
 
@@ -117,7 +123,8 @@ def build_diamond_mesh(diamond_params):
     return tmp.name, fv, fn, ff
 
 
-def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0, r_alpha=0.05):
+def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0,
+                            r_alpha=0.05, dispersion=True):
     """Load neural BSDF with numerical stability."""
     
     model_m = Model_M().to(device)
@@ -164,6 +171,7 @@ def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0, r_
     props['ext_ior'] = diamond_params['ext_ior']
     props['type'] = 'neural_diamond'
     props['r_alpha'] = r_alpha
+    props['dispersion'] = dispersion
 
     bsdf = NeuralDiamond(props)
     bsdf.model_m = mlp_m
@@ -218,8 +226,22 @@ def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0, r_
     return bsdf
 
 
-def load_analytic_bsdf(diamond_params):
-    """Create analytic dielectric BSDF."""
+def load_analytic_bsdf(diamond_params, dispersion=True):
+    """
+    Analytic dielectric for the ground-truth path.
+
+    Under a spectral variant this is the dispersive replacement, which is
+    what actually produces fire -- Mitsuba's stock `dielectric` takes one
+    scalar IOR and stays achromatic even in a spectral variant, so simply
+    switching variants changes nothing visible.
+    """
+    if IS_SPECTRAL and dispersion:
+        return {
+            'type': 'dispersive_dielectric',
+            'int_ior': diamond_params['int_ior'],
+            'ext_ior': diamond_params['ext_ior'],
+            'dispersion': True,
+        }
     return {
         'type': 'dielectric',
         'int_ior': diamond_params['int_ior'],
@@ -640,15 +662,21 @@ def main():
     ply_path, vertices, normals, faces = build_diamond_mesh(diamond_params)
     
     # Build BSDF
+    dispersion = IS_SPECTRAL and not args.no_dispersion
+    print(f"✓ Variant: {variant}"
+          f"{' (spectral)' if IS_SPECTRAL else ' (RGB -- fire is not representable)'}")
+    print(f"✓ Dispersion: {'on' if dispersion else 'off'}")
+
     if args.no_neural:
         print("✓ Mode: analytic ground truth (--no_neural)")
-        bsdf = load_analytic_bsdf(diamond_params)
+        bsdf = load_analytic_bsdf(diamond_params, dispersion)
     else:
         print("✓ Mode: neural shading (Model_M + DiamondFacet)")
-        bsdf = load_neural_bsdf_direct(checkpoint_dir, diamond_params, args.clamp_value, args.r_alpha)
+        bsdf = load_neural_bsdf_direct(checkpoint_dir, diamond_params,
+                                       args.clamp_value, args.r_alpha, dispersion)
         if bsdf is None:
             print("⚠ Neural BSDF failed to load - falling back to dielectric")
-            bsdf = load_analytic_bsdf(diamond_params)
+            bsdf = load_analytic_bsdf(diamond_params, dispersion)
 
     # Disable megakernel
     for flag in [dr.JitFlag.LoopRecord, dr.JitFlag.VCallRecord, dr.JitFlag.VCallOptimize]:

@@ -2,7 +2,10 @@ from config import device, variant
 
 import mitsuba as mi
 import drjit as dr
-mi.set_variant(variant)
+# Respect a variant the caller has already chosen (e.g. a scalar_spectral
+# test harness) instead of forcing the configured one.
+if mi.variant() is None:
+    mi.set_variant(variant)
 
 class DiamondShading(mi.BSDF):
     def __init__(self, params):
@@ -34,14 +37,14 @@ class DiamondShading(mi.BSDF):
         bs.wo = dr.select(selected, wo_r, wo_t)
         bs.eta = dr.select(selected, 1.0, eta_it)
 
-        value = mi.Color3f(1.0) # always 1 for diamond dialectric
+        value = mi.UnpolarizedSpectrum(1.0) # always 1 for diamond dialectric
 
         valid = active & (bs.pdf >0.0)
-        return bs, dr.select(valid, value, mi.Color3f(0.0))
+        return bs, dr.select(valid, value, mi.UnpolarizedSpectrum(0.0))
     
 
     def eval(self, ctx, sc, wo, active):
-        return mi.Color3f(0.0)
+        return mi.UnpolarizedSpectrum(0.0)
 
     def pdf (self, ctx, sc, wo, active):
         return mi.Float(0.0)
@@ -57,7 +60,7 @@ class DiamondShading(mi.BSDF):
     #missing 
     """
     def eval_attribute(self, name, si, active):
-        return mi.Color3f(0.0)
+        return mi.UnpolarizedSpectrum(0.0)
     """
     def to_string (self):
         return f"DiamondFacet[int_ior={self.int_ior}, ext_ior={self.ext_ior}]"

@@ -81,8 +81,37 @@ Aiming at a single point caps the achievable local incidence angle on each facet
 of 64 incident bins empty (reproduced: 41/64 occupied). Downward-tilted facets are precisely
 the ones whose (wi, wo) configurations are never gathered.
 
-Proposed fix: jitter the aim point across the stone's projected disc rather than aiming at
-the origin. Expected to fill 64/64 bins.
+Aiming every ray at one point also means each sampled direction produces exactly *one* ray —
+the line from `3R*u` through the centre — so a facet is only ever entered by the narrow cone
+of directions it subtends from the centre, and its local incidence angle is pinned near its
+own normal.
+
+**Fixed.** `collect_rdm` now offsets each origin by a uniform sample on the disc of radius
+`bounding_radius` perpendicular to the beam (`sample_aim_offsets`, `utils/rdm.py`), sweeping
+the stone with a parallel beam over its full projected area. Ray *directions* are unchanged,
+so whichever `--sampling_method` is in force still produces the incoming distribution it was
+chosen for. `--no_aim_jitter` restores the old behaviour for reproducing run_09/run_10.
+
+**[measured]** 200K rays, `round_diamond_gia`, theta_bins 8 / phi_bins 16:
+
+| | centre-aimed | disc-jittered |
+|---|---|---|
+| incident bins occupied | 41/64 | **64/64** |
+| occupancy by theta_i band | 16, 14, 11, **0** | 16, 16, 16, 16 |
+| outgoing cells non-zero | 1179/24576 | **21723/24576** |
+| samples per bin (min/median/max) | 0 / 1342 / 15901 | 775 / 1986 / 4064 |
+
+The grazing band (theta_i in [67.5, 90]) was **completely empty** before — 0 of 16 bins —
+which is the direct cause of the dead down-tilted facets, since those can only be lit at
+grazing incidence from the crown side.
+
+31.1% of jittered rays miss the stone by design (the disc is the bounding circle, the
+silhouette is smaller). They are excluded from the histogram *counts* as well as zeroed in
+throughput, via a new `active` argument to `compute_histogram_4d` — counting them would have
+diluted every bin mean toward black in proportion to the miss rate.
+
+Still to do: re-gather and retrain, then re-measure the Section 2.1 dead-facet table. The
+numbers above are coverage, not appearance.
 
 ### 2.2 Darkness is never trained **[measured]**
 
@@ -95,6 +124,64 @@ if rgb.sum() > 1e-6:  # Non-zero bin
 This drops every zero bin, so only 944 of 8192 bins (11.5%) reach the optimiser and the
 network never sees a dark example. A model that cannot represent darkness cannot represent
 the contrast the residual layer is supposed to sit against.
+
+**Fixed.** A zero in `rdm_m` has two meanings and the old filter conflated them. Either the
+incoming bin *was* sampled and no energy left in that outgoing direction — a measurement of
+darkness, which belongs in the training set — or the incoming bin was never sampled, in
+which case `compute_histogram_4d` divided a zero sum by a zero count and mapped the NaN to
+0, so the array reads 0 without anything having been observed. The array cannot tell them
+apart; `count_i` can, and was already in `rdm.npz` unused by the trainer.
+`prepare_training_data` now takes it and keeps every bin under an observed incoming
+direction, dark or lit, while still excluding the unobserved ones. `--drop_zero_bins`
+restores the old filter.
+
+`prepare_transmittance_data`'s similar-looking `total > 1e-6` guard is deliberately left
+alone: its target is the ratio `total_t / total`, which really is undefined when nothing
+left the stone. There is no measured-dark case to rescue there.
+
+**[measured]** Composition, on run_09's existing RDM (8192 bins):
+
+| | bins |
+|---|---|
+| lit | 949 |
+| measured dark — was silently dropped | 4299 |
+| unobserved — correctly still excluded | 2944 |
+
+11.6% of the domain reaches the optimiser before, 64.1% after. Not 100%, because the 2944
+unobserved bins are exactly the 23 empty incoming bins of Section 2.1 times 128 outgoing
+bins — the two defects are quantitatively consistent, and **2.2's benefit is capped by 2.1
+until the stone is re-gathered.**
+
+**[measured]** Effect on the trained model. Model_M, 5000 epochs, lr 1e-3, batch 4096 —
+run_09's own training command — evaluated over all 5248 usable bins:
+
+| | old filter | fix 2.2 |
+|---|---|---|
+| dark bins predicted < 1e-3 | 24.9% | **85.6%** |
+| dark bins predicted < 1e-2 | 55.0% | 92.9% |
+| dark-bin prediction, median | 0.0065 | ~0 |
+| dark-bin prediction, p90 | 0.209 | **0.0038** |
+| dark-bin prediction, max | 87.7 | 1.59 |
+| dark/lit mean ratio | 0.153 | **0.016** |
+| log-space r on lit bins | +0.4704 | +0.4739 |
+| RMSE on lit bins | 0.747 | 0.919 |
+
+Darkness is now represented — a 10x improvement in dark/lit separation — at no cost to
+lit-bin *correlation* and a 23% cost in lit-bin RMSE. That trade is the right way round for
+a stone whose appearance is mostly contrast. Note the old model's 87.7 maximum on bins it
+was never shown: unconstrained extrapolation into the dark part of the domain, which is the
+mechanism by which the missing training data leaked into the render as a grey floor.
+
+One caveat worth recording, because it cost a wrong conclusion once: at 400 epochs the fix
+appears to *hurt* (dark/lit ratio 0.38 -> 0.78), because the extra 4299 near-zero targets
+slow the fit globally under MSE on raw radiance before they sharpen it. The effect only
+inverts with enough epochs. Any future ablation of this flag must run to convergence.
+
+Still open, and not changed here because it is a modelling decision rather than a defect:
+`train_model` uses `nn.MSELoss` on raw radiance while lit targets span 0.0006 to 7.07, so
+the loss is dominated by a handful of bright bins. A relative or log-space loss is the
+obvious candidate and would change the ablation against Soh & Montazeri, so it should be
+argued for explicitly rather than slipped in.
 
 ### 2.3 The recorded commands gather and evaluate on different geometry **[measured]**
 

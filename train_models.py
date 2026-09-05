@@ -52,6 +52,10 @@ def parse_args():
                        help="Batch size for training")
     parser.add_argument("--no_plot", action='store_true',
                        help="Skip plotting loss curves")
+    parser.add_argument("--drop_zero_bins", action='store_true',
+                       help="Train Model_M only on bins that carry energy, discarding "
+                            "measured-dark ones. Reproduces pre-fix checkpoints "
+                            "(run_09, run_10); the model then never sees a dark example.")
     return parser.parse_args()
 
 
@@ -112,12 +116,35 @@ def load_rdm_data(checkpoint_dir):
     return rdm_t, rdm_r, rdm_m, count_t, count_r, count_m, x, sa
 
 
-def prepare_training_data(rdm_m, x, sa):
+def prepare_training_data(rdm_m, x, sa, count_i=None, drop_zero_bins=False):
     """
     Prepare training data for Model_M.
-    
+
     Input: (θi, φi, θo, φo) → wi (3D), wo (3D) → RGB
-    
+
+    A zero in rdm_m is ambiguous, and the two cases must be treated
+    differently:
+
+      * the incoming-direction bin was sampled and no energy left in this
+        outgoing direction. That is a *measurement* -- the RDM really is
+        dark there -- and it belongs in the training set. Diamond
+        appearance is mostly contrast between lit and unlit directions, so
+        a model shown only the lit ones has been asked to learn half a
+        function and has no way to represent the other half.
+
+      * the incoming-direction bin was never sampled at all. Then
+        compute_histogram_4d divided a zero sum by a zero count and mapped
+        the resulting NaN to 0, so the array reads 0 without anything
+        having been measured. Training on those teaches the network
+        darkness that was never observed.
+
+    The array alone cannot tell them apart; `count_i` (samples per incoming
+    bin, saved as count_t/count_r/count_m -- they are one array) can, and is
+    the only correct mask. If it is missing, every bin is assumed observed.
+
+    drop_zero_bins=True restores the old `rgb.sum() > 1e-6` filter, which
+    kept only lit bins, for reproducing pre-fix checkpoints.
+
     Returns:
         X: (N, 6) - [wi_x, wi_y, wi_z, wo_x, wo_y, wo_z]
         Y: (N, 3) - [R, G, B]
@@ -127,43 +154,68 @@ def prepare_training_data(rdm_m, x, sa):
     theta_o_centers = x[:, :, :, :, 2]
     phi_o_centers = x[:, :, :, :, 3]
     
+    if count_i is None:
+        print("  [warn] no sample counts in this RDM; assuming every incoming "
+              "bin was observed")
+        observed = np.ones(rdm_m.shape[:2], dtype=bool)
+    else:
+        observed = np.asarray(count_i) > 0
+
     X = []
     Y = []
-    
+    n_dark = 0
+    n_lit = 0
+
     for ti in range(rdm_m.shape[0]):
         for pi in range(rdm_m.shape[1]):
+            if not observed[ti, pi]:
+                continue
             for to in range(rdm_m.shape[2]):
                 for po in range(rdm_m.shape[3]):
                     rgb = rdm_m[ti, pi, to, po]
-                    if rgb.sum() > 1e-6:  # Non-zero bin
-                        # Convert angles to direction vectors
-                        theta_i = theta_i_centers[ti, pi, to, po]
-                        phi_i = phi_i_centers[ti, pi, to, po]
-                        theta_o = theta_o_centers[ti, pi, to, po]
-                        phi_o = phi_o_centers[ti, pi, to, po]
-                        
-                        wi = np.array([
-                            np.sin(theta_i) * np.cos(phi_i),
-                            np.sin(theta_i) * np.sin(phi_i),
-                            np.cos(theta_i)
-                        ], dtype=np.float32)
-                        
-                        wo = np.array([
-                            np.sin(theta_o) * np.cos(phi_o),
-                            np.sin(theta_o) * np.sin(phi_o),
-                            np.cos(theta_o)
-                        ], dtype=np.float32)
-                        
-                        X.append(np.concatenate([wi, wo]))
-                        Y.append(rgb)
-    
+                    if rgb.sum() <= 1e-6:
+                        n_dark += 1
+                        if drop_zero_bins:
+                            continue
+                    else:
+                        n_lit += 1
+
+                    # Convert angles to direction vectors
+                    theta_i = theta_i_centers[ti, pi, to, po]
+                    phi_i = phi_i_centers[ti, pi, to, po]
+                    theta_o = theta_o_centers[ti, pi, to, po]
+                    phi_o = phi_o_centers[ti, pi, to, po]
+
+                    wi = np.array([
+                        np.sin(theta_i) * np.cos(phi_i),
+                        np.sin(theta_i) * np.sin(phi_i),
+                        np.cos(theta_i)
+                    ], dtype=np.float32)
+
+                    wo = np.array([
+                        np.sin(theta_o) * np.cos(phi_o),
+                        np.sin(theta_o) * np.sin(phi_o),
+                        np.cos(theta_o)
+                    ], dtype=np.float32)
+
+                    X.append(np.concatenate([wi, wo]))
+                    Y.append(rgb)
+
     X = np.array(X, dtype=np.float32)
     Y = np.array(Y, dtype=np.float32)
-    
-    print(f"  Training data: {len(X)} samples")
+
+    total_bins = int(np.prod(rdm_m.shape[:4]))
+    unobserved = total_bins - int(observed.sum()) * int(np.prod(rdm_m.shape[2:4]))
+    print(f"  Training data: {len(X)} samples of {total_bins} bins "
+          f"({100.0 * len(X) / total_bins:.1f}%)")
+    print(f"    lit          : {n_lit}")
+    print(f"    measured dark: {n_dark}"
+          + ("  (excluded: --drop_zero_bins)" if drop_zero_bins else ""))
+    print(f"    unobserved   : {unobserved}  (excluded; no samples in that "
+          f"incoming bin)")
     print(f"  X shape: {X.shape}, Y shape: {Y.shape}")
     print(f"  Y range: [{Y.min():.4f}, {Y.max():.4f}]")
-    
+
     return X, Y
 
 
@@ -186,7 +238,12 @@ def prepare_transmittance_data(rdm_t, rdm_r, rdm_m, x):
             total_r = rdm_r[ti, pi, :, :].sum()
             total_m = rdm_m[ti, pi, :, :].sum()
             total = total_t + total_r + total_m
-            
+
+            # Unlike Model_M's mask, this guard is not the 2.2 defect: the
+            # target here is a *ratio* total_t/total, which is genuinely
+            # undefined when nothing left the stone in this incoming bin
+            # (never sampled, or every path trapped by TIR). There is no
+            # "measured dark" case to rescue -- do not relax it to match.
             if total > 1e-6:
                 # Transmittance = total_t / total
                 transmittance = total_t / total
@@ -314,10 +371,10 @@ def main():
     
     # Prepare training data for Model_M
     print("\nPreparing Model_M training data...")
-    X_m, Y_m = prepare_training_data(rdm_m, x, sa)
-    
+    X_m, Y_m = prepare_training_data(rdm_m, x, sa, count_m, args.drop_zero_bins)
+
     if len(X_m) == 0:
-        raise ValueError("No non-zero bins found in rdm_m!")
+        raise ValueError("No usable bins found in rdm_m!")
     
     # Prepare training data for Model_T
     print("\nPreparing Model_T training data...")

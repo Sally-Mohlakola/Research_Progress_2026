@@ -18,6 +18,10 @@ parser.add_argument("--max_depth", type=int, help="Max path bounces before Russi
                      default=64)
 parser.add_argument("--sampling_method", type=str, help="Sampling method: uniform, cos_theta, or stratified",
                      default="stratified", choices=["uniform", "cos_theta", "stratified"])
+parser.add_argument("--no_aim_jitter", action="store_true",
+                     help="Aim every gather ray at the stone's centre instead of sweeping its "
+                          "projected disc. Reproduces pre-fix checkpoints (run_09, run_10); "
+                          "leaves most (facet, incidence angle) bins unreachable.")
 
 args = parser.parse_args()
 
@@ -34,6 +38,7 @@ rdm_t, rdm_r, rdm_m, count_t, count_r, count_m, x, sa = compute_rdm(
     batch_size=args.batch_size,
     diamond_kwargs=diamond_kwargs,
     sampling_method=args.sampling_method,
+    aim_jitter=not args.no_aim_jitter,
 )
 
 rdm_t, rdm_r, rdm_m, count_t, count_r, count_m, x, sa = [
@@ -50,6 +55,7 @@ np.savez(
     diamond_name=args.diamond_name,
     theta_bins=args.theta_bins,
     phi_bins=args.phi_bins,
+    aim_jitter=not args.no_aim_jitter,
 )
 
 

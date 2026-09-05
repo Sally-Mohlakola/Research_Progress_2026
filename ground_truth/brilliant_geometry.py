@@ -144,50 +144,53 @@ def make_round_brilliant(
     for i in range(n):
         tri(table_center, table_ring[i], table_ring[(i + 1) % n])
 
-    # ── PAVILION ───────────────────────────────────────────────────
+    # ── PAVILION ───────────────────────────────────────────
+    # Every girdle edge must be covered by exactly one pavilion triangle.
+    # Emitting a triangle twice is not harmless: the two copies are exactly
+    # coincident, so a ray that refracts through one immediately hits the
+    # other at t ~ 0 and refracts straight back out. The stone then leaks
+    # the background through those wedges instead of bending light, which
+    # reads as flat unshaded grey patches seen through the crown.
     if culet_ring is None:
-        # Sharp-point culet: main facets go straight from girdle to the
-        # culet point; lower-girdle facets are small triangles between
-        # two main facets, also terminating at the culet point.
+        # Sharp-point culet: the pavilion is a closed fan from the culet
+        # point out to the 16-point girdle ring -- two triangles per main
+        # facet direction, i.e. exactly one per girdle edge. The
+        # lower-girdle facets degenerate into that same fan here, so they
+        # need no triangles of their own.
         for i in range(n):
             g_even = girdle_ring[2 * i]
             g_odd_next = girdle_ring[(2 * i + 1) % n2]
             g_odd_prev = girdle_ring[(2 * i - 1) % n2]
-            g_even_next = girdle_ring[(2 * i + 2) % n2]
 
             # Main pavilion facet (kite): girdle even point down to culet,
             # flanked by the two adjacent odd (lower-girdle) points.
             tri(g_even, g_odd_prev, culet_center)
             tri(g_even, culet_center, g_odd_next)
-
-            # Lower-girdle facet: odd girdle point + the two main facets'
-            # shared edge at the culet (degenerate to a point here).
-            tri(g_odd_next, culet_center, g_even_next)
     else:
-        # Small flat culet patch: main + lower-girdle facets terminate on
-        # the culet ring instead of a single point, then the ring is
-        # capped with its own small flat facet.
+        # Small flat culet patch: the pavilion is a band between the
+        # 16-point girdle ring and the n-point culet ring. Three triangles
+        # per main direction cover the two girdle edges either side of
+        # g_even plus the one culet edge between c_this and c_next.
         for i in range(n):
             g_even = girdle_ring[2 * i]
             g_odd_next = girdle_ring[(2 * i + 1) % n2]
-            g_odd_prev = girdle_ring[(2 * i - 1) % n2]
+            g_even_next = girdle_ring[(2 * i + 2) % n2]
             c_this = culet_ring[i]
             c_next = culet_ring[(i + 1) % n]
-            c_prev = culet_ring[(i - 1) % n]
 
-            # Main pavilion facet (quad -> 2 tris): girdle even point down
-            # to its corresponding culet-ring point, flanked by odd points.
-            tri(g_even, c_prev, c_this)
-            tri(g_even, g_odd_prev, c_prev)
+            # Main pavilion facet (kite) halves: each girdle edge adjacent
+            # to a main direction drops to that direction's culet point.
             tri(g_even, c_this, g_odd_next)
+            tri(g_even_next, g_odd_next, c_next)
 
-            # Lower-girdle facet: odd girdle point connects the two
-            # neighboring culet-ring points.
+            # Lower-girdle facet: the odd girdle point spans the culet edge.
             tri(g_odd_next, c_this, c_next)
 
-        # Cap the small flat culet patch
+        # Cap the small flat culet patch. Wound the opposite way from the
+        # table cap so its normal points down and out of the stone rather
+        # than up into it.
         for i in range(n):
-            tri(culet_center, culet_ring[i], culet_ring[(i + 1) % n])
+            tri(culet_center, culet_ring[(i + 1) % n], culet_ring[i])
 
     vertices = np.array(verts, dtype=np.float32)
     faces = np.array(faces, dtype=np.uint32)

@@ -35,7 +35,6 @@ mi.set_variant("scalar_spectral")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bsdf.dispersive_dielectric import DispersiveDielectric
-from utils.studio_env import studio_lighting, display_exposure
 
 # ─────────────────────────────────────────────
 # 1. Geometry
@@ -98,9 +97,7 @@ base_scene_dict = {
 
     "integrator": {
         "type": "path",
-        # See the note in eval.py: 24 truncates paths that a diamond
-        # genuinely needs, and those show up as black facets.
-        "max_depth": 64,
+        "max_depth": 24,
     },
 
     "sensor": {
@@ -124,17 +121,52 @@ base_scene_dict = {
         },
     },
 
-    # Lighting comes from utils/studio_env.py, shared with eval.py so the
-    # analytic and neural renders are lit identically. It must not be a
-    # single constant environment: every path escaping the stone would then
-    # return the same radiance whatever route it took, and the facets would
-    # render as flat unshaded grey.
-    **studio_lighting(),
+    "envmap": {
+        "type": "constant",
+        "radiance": {"type": "rgb", "value": [0.55, 0.58, 0.65]},
+    },
 
     "ground": {
         "type": "rectangle",
         "to_world": mi.ScalarTransform4f.translate([0, 0, -0.86]).scale([6, 6, 1]),
         "bsdf": ground_bsdf,
+    },
+
+    "key_light": {
+        "type": "rectangle",
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[3.0, -3.5, 5.0],
+            target=[0.0, 0.0, 0.0],
+            up=[0.0, 0.0, 1.0],
+        ).scale([1.2, 1.2, 1.0]),
+        "emitter": {
+            "type": "area",
+            "radiance": {"type": "rgb", "value": [40.0, 38.0, 35.0]},
+        },
+    },
+    "rim_light": {
+        "type": "rectangle",
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[-3.5, 2.5, 1.5],
+            target=[0.0, 0.0, 0.0],
+            up=[0.0, 0.0, 1.0],
+        ).scale([1.0, 1.0, 1.0]),
+        "emitter": {
+            "type": "area",
+            "radiance": {"type": "rgb", "value": [10.0, 14.0, 22.0]},
+        },
+    },
+    "top_light": {
+        "type": "rectangle",
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[0.0, 0.0, 6.0],
+            target=[0.0, 0.0, 0.0],
+            up=[0.0, 1.0, 0.0],
+        ).scale([2.0, 2.0, 1.0]),
+        "emitter": {
+            "type": "area",
+            "radiance": {"type": "rgb", "value": [12.0, 12.0, 13.0]},
+        },
     },
 
     # Mesh will be added with rotation
@@ -282,12 +314,9 @@ def create_rotation_animation(
         # Render frame
         image = render_frame(i, total_frames, rotation_axis)
         
-        # Save frame as PNG. The studio rig emits normalised radiance (1.0 is
-        # its brightest source), so the frame has to be scaled by
-        # `display_exposure()` before the sRGB curve or it comes out near black.
-        # The EXR below stays raw.
+        # Save frame as PNG
         frame_path = os.path.join(output_dir, f"frame_{i:04d}.png")
-        bmp = mi.Bitmap(np.array(image) * display_exposure())
+        bmp = mi.Bitmap(image)
         bmp = bmp.convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.UInt8, srgb_gamma=True)
         bmp.write(frame_path)
         frames.append(frame_path)

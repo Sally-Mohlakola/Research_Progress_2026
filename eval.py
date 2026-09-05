@@ -23,33 +23,14 @@ import mitsuba as mi
 import drjit as dr
 from pathlib import Path
 
-# There is a second, older copy of this project at the path below. It used to
-# be prepended to sys.path, which meant that under WSL -- where that path
-# exists -- `config`, `utils`, `neural` and `bsdf` all resolved to the *other*
-# checkout no matter which one you actually ran, so edits made here silently
-# had no effect and the two trees drifted apart. Append instead, so the
-# checkout this file lives in always wins and the old one is only a fallback.
-_here = os.path.dirname(os.path.abspath(__file__))
-if _here not in sys.path:
-    sys.path.insert(0, _here)
-
 project_root = '/mnt/c/Users/sally/research/diamond_rendering'
-if os.path.exists(project_root) and os.path.abspath(project_root) != _here:
-    sys.path.append(project_root)
+if os.path.exists(project_root):
+    sys.path.insert(0, project_root)
     for subdir in ['utils', 'config', 'neural', 'bsdf']:
         p = os.path.join(project_root, subdir)
-        if os.path.exists(p): sys.path.append(p)
+        if os.path.exists(p): sys.path.insert(0, p)
 
 from config import device, variant
-from config import parameters as _params
-
-# The older checkout calls this table DIAMOND_PRESETS; this one calls it
-# DIAMOND_VARIANTS. Accept whichever the resolved `config` package provides.
-DIAMOND_VARIANTS = getattr(_params, 'DIAMOND_VARIANTS', None)
-if DIAMOND_VARIANTS is None:
-    DIAMOND_VARIANTS = _params.DIAMOND_PRESETS
-print(f"✓ config.parameters: {_params.__file__} "
-      f"({len(DIAMOND_VARIANTS)} variants)")
 
 # Register NeuralDiamond BSDF
 from bsdf.neural_bsdf import NeuralDiamond
@@ -62,7 +43,6 @@ from bsdf.analytic_bsdf import DiamondShading
 from bsdf.dispersive_dielectric import DispersiveDielectric
 from bsdf.dispersion import IS_SPECTRAL
 from bsdf.rdm_sampler import build_rdm_sampler
-from utils.studio_env import studio_lighting, display_exposure
 from neural.base_model import Model_M, Model_T
 from neural.drjit_wrapper import MiModelWrapper
 
@@ -76,15 +56,7 @@ def parse_args():
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--output_dir", type=str, default="rolling_animation")
     parser.add_argument("--frames", type=int, default=10, help="Number of animation frames")
-    parser.add_argument("--exposure", type=float, default=None,
-                        help="Linear multiplier applied before the gamma curve "
-                             "when writing the PNG (the EXR is always raw "
-                             "radiance). Defaults to utils.studio_env's "
-                             "display_exposure(), which is the value that puts "
-                             "the stone in midtone under the studio rig: about "
-                             "2%% of it clipped and about two thirds in "
-                             "midtone. It tracks the rig, so it stays correct "
-                             "if the panel radiances change.")
+    parser.add_argument("--exposure", type=float, default=1.0)
     parser.add_argument("--r_alpha", type=float, default=0.05,
                         help="Roughness of the analytic direct-reflection lobe S_R. "
                              "Lower = sharper, brighter highlights (a real polished "
@@ -102,35 +74,23 @@ def parse_args():
     return parser.parse_args()
 
 
-# Geometry presets. `config/parameters.py` is the single source of truth --
-# it is what `gather_rdm.py` and `train_models.py` read, so anything defined
-# only here would be a stone the model can never have been trained on.
-#
-# That is not hypothetical: this file used to carry its own dict, which did
-# not contain `round_diamond_gia` (the variant every checkpoint was gathered
-# on) but did contain `princess`. `renders/gt_test_12` and
-# `renders/diamond_test_12` were consequently rendered on a 4-main-facet
-# stone with 21 facets while run_07's model had been fitted to an
-# 8-main-facet stone with 57, and the neural render was being asked to shade
-# facet orientations that do not exist in its training set.
-#
-# The two names below that only ever existed here are kept as aliases so old
-# commands still resolve, but they now resolve to the shared definitions.
-#
-# Keep this table under its own name: rebinding `DIAMOND_VARIANTS` here would
-# shadow the import above, so the shared definitions could no longer be read
-# back, and `main()` looks the preset up as `DIAMOND_PRESETS`.
-DIAMOND_PRESETS = dict(DIAMOND_VARIANTS)
-for _alias, _target in (('round_brilliant_sharp_culet', 'round_diamond_sharp_culet'),
-                        ('round_brilliant_culet', 'round_diamond_gia')):
-    # Tolerate the older checkout, whose table may not carry these names.
-    if _alias not in DIAMOND_PRESETS and _target in DIAMOND_VARIANTS:
-        DIAMOND_PRESETS[_alias] = dict(DIAMOND_VARIANTS[_target])
-DIAMOND_PRESETS.setdefault('princess', dict(
-    girdle_radius=1.0, crown_angle_deg=35.0, pavilion_angle_deg=41.0,
-    table_frac=0.60, num_main_facets=4, culet_radius=0.0,
-    int_ior=2.419, ext_ior=1.000277,
-))
+DIAMOND_PRESETS = {
+    'round_brilliant_sharp_culet': dict(
+        girdle_radius=1.0, crown_angle_deg=34.5, pavilion_angle_deg=40.75,
+        table_frac=0.56, num_main_facets=8, culet_radius=0.0,
+        int_ior=2.419, ext_ior=1.000277,
+    ),
+    'round_brilliant_culet': dict(
+        girdle_radius=1.0, crown_angle_deg=34.5, pavilion_angle_deg=40.75,
+        table_frac=0.56, num_main_facets=8, culet_radius=0.02,
+        int_ior=2.419, ext_ior=1.000277,
+    ),
+    'princess': dict(
+        girdle_radius=1.0, crown_angle_deg=35.0, pavilion_angle_deg=41.0,
+        table_frac=0.60, num_main_facets=4, culet_radius=0.0,
+        int_ior=2.419, ext_ior=1.000277,
+    ),
+}
 
 
 def write_ply(path, vertices, normals, faces):
@@ -403,13 +363,7 @@ def create_scene(diamond_params, bsdf, width, height, frame_idx, total_frames,
 
         'integrator': {
             'type': 'path',
-            # A diamond total-internally-reflects a lot, and a path that hits
-            # the cap contributes exactly 0 -- it reads as an unshaded black
-            # patch. Measured share of the stone below the black point on
-            # round_diamond_gia: 33.1% at depth 24, 30.2% at 64, 30.0% at 128.
-            # Converged by 64; the rest of the black is a lighting problem,
-            # not a truncation one (see utils/studio_env.AMBIENT_RADIANCE).
-            'max_depth': 64,
+            'max_depth': 24,
         },
 
         'sensor': {
@@ -433,16 +387,67 @@ def create_scene(diamond_params, bsdf, width, height, frame_idx, total_frames,
             },
         },
 
-        # Lighting comes from utils/studio_env.py. It must not be a single
-        # constant environment: every path that escapes the stone would then
-        # return the same radiance whatever route it took, so the facets
-        # render as flat unshaded grey and dispersion cannot show colour.
-        **studio_lighting(),
+        'envmap': {
+            'type': 'constant',
+            'radiance': {'type': 'rgb', 'value': [0.55, 0.58, 0.65]},
+        },
 
         'ground': {
             'type': 'rectangle',
             'to_world': sT.translate([0, 0, -0.9]).scale([8, 8, 1]),
             'bsdf': ground_bsdf,
+        },
+
+        'key_light': {
+            'type': 'rectangle',
+            'to_world': sT.look_at(
+                origin=[3.0, -3.5, 5.0],
+                target=[0.0, 0.0, 0.0],
+                up=[0.0, 0.0, 1.0],
+            ).scale([1.2, 1.2, 1.0]),
+            'emitter': {
+                'type': 'area',
+                'radiance': {'type': 'rgb', 'value': [40.0, 38.0, 35.0]},
+            },
+        },
+
+        'rim_light': {
+            'type': 'rectangle',
+            'to_world': sT.look_at(
+                origin=[-3.5, 2.5, 1.5],
+                target=[0.0, 0.0, 0.0],
+                up=[0.0, 0.0, 1.0],
+            ).scale([1.0, 1.0, 1.0]),
+            'emitter': {
+                'type': 'area',
+                'radiance': {'type': 'rgb', 'value': [10.0, 14.0, 22.0]},
+            },
+        },
+
+        'top_light': {
+            'type': 'rectangle',
+            'to_world': sT.look_at(
+                origin=[0.0, 0.0, 6.0],
+                target=[0.0, 0.0, 0.0],
+                up=[0.0, 1.0, 0.0],
+            ).scale([2.0, 2.0, 1.0]),
+            'emitter': {
+                'type': 'area',
+                'radiance': {'type': 'rgb', 'value': [12.0, 12.0, 13.0]},
+            },
+        },
+
+        'fill_light': {
+            'type': 'rectangle',
+            'to_world': sT.look_at(
+                origin=[-2.0, -3.0, 2.0],
+                target=[0.0, 0.0, 0.0],
+                up=[0.0, 0.0, 1.0],
+            ).scale([1.0, 1.0, 1.0]),
+            'emitter': {
+                'type': 'area',
+                'radiance': {'type': 'rgb', 'value': [8.0, 10.0, 12.0]},
+            },
         },
 
         'diamond': {
@@ -490,26 +495,16 @@ def render_frame(scene, spp, frame_idx, total_frames):
                 img_np = np.nan_to_num(img_np, nan=0.0, posinf=0.0, neginf=0.0)
                 img = mi.TensorXf(img_np)
             
-            # `mi.render` already returns the *mean* over its own samples, so
-            # the batches must be combined as a sample-weighted mean. Summing
-            # the batch means and then dividing by the total sample count
-            # divided every frame by an extra factor of `batch_size` (8x at the
-            # default spp), which is what made the stone render as flat black
-            # with a few blown-out facets and no midtones in between.
-            contribution = img * batch_spp
-            image = contribution if image is None else image + contribution
+            image = img if image is None else image + img
             dr.flush_malloc_cache()
         
         image /= spp
         return image
         
     except Exception as e:
-        # `args` is not in scope here, so referencing it turned every render
-        # failure into a NameError that hid the real cause. Take the frame
-        # size from the sensor instead.
         print(f"    ⚠ Error rendering frame {frame_idx+1}: {e}")
-        w, h = scene.sensors()[0].film().crop_size()
-        return mi.TensorXf(np.zeros((h, w, 3), dtype=np.float32))
+        # Return black frame
+        return mi.TensorXf(np.zeros((args.height, args.width, 3), dtype=np.float32))
 
 
 def create_animation_frames(args, bsdf, diamond_params, vertices, normals, faces):
@@ -643,8 +638,6 @@ def create_video(frames, output_dir, fps=30):
 
 def main():
     args = parse_args()
-    if args.exposure is None:
-        args.exposure = display_exposure()
 
     checkpoint_dir = os.path.join('checkpoints', args.checkpoint_name)
     if not os.path.exists(checkpoint_dir):

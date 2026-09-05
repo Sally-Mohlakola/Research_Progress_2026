@@ -153,51 +153,17 @@ def fresnel_spectral(cos_theta, si, int_ior, ext_ior, dispersion=True):
     return out
 
 
-_SRGB_BASIS = None
-
-
-def _srgb_basis():
-    """
-    Smooth reflectance spectra for the three sRGB primaries, normalised so
-    they sum to one at every wavelength.
-
-    `mi.srgb_model_fetch` is the function that turns an RGB value into
-    Mitsuba's smooth-spectrum coefficients, but its signature is
-    `(ScalarColor3f) -> Array3f`: it is a lookup into a scalar coefficient
-    table and cannot be called on a vectorised colour. Fetching per shading
-    point is therefore impossible, which is what made the earlier version of
-    rgb_to_spectrum fail under llvm_ad_spectral.
-
-    The fetch is instead done three times at startup, on the pure primaries.
-    Evaluating those three spectra at the ray's wavelengths and mixing them
-    linearly is vectorised, and reconstructs the intended colour to within a
-    few percent. Dividing by their sum makes it exact for neutral values --
-    an RGB of (v, v, v) returns exactly v at every wavelength -- which
-    matters here because Model_M's output is a radiance ratio for a
-    near-colourless stone, so a systematic gain would bias every energy
-    comparison.
-    """
-    global _SRGB_BASIS
-    if _SRGB_BASIS is None:
-        def fetch(c):
-            return mi.Color3f(mi.srgb_model_fetch(mi.ScalarColor3f(*c)))
-        _SRGB_BASIS = (fetch((1.0, 0.0, 0.0)),
-                       fetch((0.0, 1.0, 0.0)),
-                       fetch((0.0, 0.0, 1.0)))
-    return _SRGB_BASIS
-
-
 def rgb_to_spectrum(rgb, wavelengths):
     """
-    Lift an RGB value to a spectrum at the given wavelengths.
+    Lift an RGB value to a spectrum via Mitsuba's sRGB upsampling.
 
     Needed because Model_M was trained to emit three numbers, and under a
-    spectral variant a BSDF must return N wavelength samples.
-
-    Unlike the sRGB upsampling model this is built from, the mix is linear in
-    `rgb`, so no [0, 1] clamp is required and Model_M's output is free to
-    exceed 1 -- which it routinely does, being a radiance ratio rather than a
-    reflectance.
+    spectral variant a BSDF must return N wavelength samples. `srgb_model_*`
+    expects a reflectance in [0, 1], so the value is split into a scalar
+    magnitude and a unit-range chroma, only the chroma is upsampled, and the
+    magnitude is multiplied back afterwards. Model_M's output is a radiance
+    ratio that routinely exceeds 1, so skipping that split would silently
+    clip every bright sample.
 
     Note this gives the neural term a *colour*, not fire: the RDM it was
     fitted to has no wavelength axis, so the same spectrum is returned
@@ -206,12 +172,10 @@ def rgb_to_spectrum(rgb, wavelengths):
     if not IS_SPECTRAL:
         return rgb
 
-    c_r, c_g, c_b = _srgb_basis()
-    sr = mi.srgb_model_eval(c_r, wavelengths)
-    sg = mi.srgb_model_eval(c_g, wavelengths)
-    sb = mi.srgb_model_eval(c_b, wavelengths)
-    total = sr + sg + sb
-    return (rgb.x * sr + rgb.y * sg + rgb.z * sb) / dr.maximum(total, 1e-6)
+    scale = dr.maximum(dr.maximum(rgb.x, rgb.y), rgb.z)
+    unit = dr.clip(rgb / dr.maximum(scale, 1e-8), 0.0, 1.0)
+    coeff = mi.srgb_model_fetch(unit)
+    return mi.srgb_model_eval(coeff, wavelengths) * scale
 
 
 def to_rgb3(value):

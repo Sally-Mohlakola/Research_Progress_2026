@@ -23,7 +23,8 @@ if mi.variant() is None:
     mi.set_variant(variant)
 
 from bsdf.dispersion import (
-    IS_SPECTRAL, REFERENCE_IOR, fresnel_spectral, hero_eta, rgb_to_spectrum,
+    IS_SPECTRAL, REFERENCE_IOR, fresnel_spectral, hero_eta,
+    hero_collapse_weight, rgb_to_spectrum,
 )
 
 
@@ -56,17 +57,46 @@ class NeuralDiamond(mi.BSDF):
         # slightly softened highlights. Lower it toward 0 for sharper ones.
         self.r_alpha = props.get('r_alpha', 0.05)
 
+        # Route A (CAUSTIC_LAYER_PLAN.md section 5), side-gated at k = 1.
+        #
+        # With this on, a ray arriving from *outside* the stone is handled by
+        # an explicit smooth dielectric -- Fresnel split, Snell refraction,
+        # total internal reflection -- exactly as DispersiveDielectric does
+        # it, so the ray genuinely enters the solid. A ray arriving from
+        # *inside* is handed to the neural residual S_M.
+        #
+        # The previous behaviour set bs.eta = 1 on every sample and drew both
+        # lobes from the upper hemisphere, so no camera ray ever crossed the
+        # surface. There were no internal specular chains to be sharp or
+        # blurry -- E S+ L transport did not exist in the render at all, which
+        # is the mechanism behind the missing high-frequency structure.
+        #
+        # Set false to recover the old two-lobe S_R + S_M behaviour, which is
+        # the ablation baseline for the write-up.
+        self.explicit_entry = bool(props.get('explicit_entry', True))
+
         # Neural models (set after construction)
         self.model_m = None  # Multi-scatter color: f(wi, wo) -> RGB
         self.model_t = None  # Transmittance fraction: f(wi) -> [0,1]
         self.rdm_sampler = None  # RDM direction sampler
 
-        # Glossy flags - we're sampling from learned distribution
-        # Not delta because directions come from RDM (continuous)
-        self.m_flags = (mi.BSDFFlags.GlossyReflection | 
-                        mi.BSDFFlags.GlossyTransmission |
-                        mi.BSDFFlags.FrontSide | mi.BSDFFlags.BackSide)
-        self.m_components = [self.m_flags, self.m_flags]
+        # Component 0 is the explicit entry lobe, component 1 the neural
+        # residual. Under Route A the entry lobe is a true Dirac dielectric,
+        # so it must be declared Delta or the path integrator will try to
+        # connect next-event estimation through it and MIS will double-count.
+        # The residual stays Glossy: its directions come from the RDM alias
+        # table and are continuous, so NEE through it is legitimate.
+        glossy = (mi.BSDFFlags.GlossyReflection |
+                  mi.BSDFFlags.GlossyTransmission |
+                  mi.BSDFFlags.FrontSide | mi.BSDFFlags.BackSide)
+        if self.explicit_entry:
+            entry = (mi.BSDFFlags.DeltaReflection |
+                     mi.BSDFFlags.DeltaTransmission |
+                     mi.BSDFFlags.FrontSide | mi.BSDFFlags.BackSide)
+        else:
+            entry = glossy
+        self.m_components = [entry, glossy]
+        self.m_flags = entry | glossy
     
     # ------------------------------------------------------------------
     # Neural model evaluation
@@ -119,13 +149,21 @@ class NeuralDiamond(mi.BSDF):
         Returns an UnpolarizedSpectrum either way, which is what a BSDF has
         to hand back.
         """
+        return self.eval_model_m_wi(si.wi, wo, si.wavelengths)
+
+    def eval_model_m_wi(self, wi, wo, wavelengths):
+        """
+        eval_model_m with the incoming direction supplied explicitly, so the
+        residual can be queried on a folded frame (see _fold) rather than on
+        whatever si.wi happens to hold.
+        """
         if self.model_m is None:
             return mi.UnpolarizedSpectrum(0.0)
 
-        nn_in = self._to_tensor(si.wi, wo)
+        nn_in = self._to_tensor(wi, wo)
         nn_out = self.model_m.forward(nn_in)
         rgb = dr.unravel(mi.Color3f, dr.ravel(nn_out), order='C')
-        return rgb_to_spectrum(rgb, si.wavelengths)
+        return rgb_to_spectrum(rgb, wavelengths)
     
     # ------------------------------------------------------------------
     # Analytic direct-reflection component S_R
@@ -253,6 +291,118 @@ class NeuralDiamond(mi.BSDF):
     # BSDF interface - Fully neural
     # ------------------------------------------------------------------
     
+    # ------------------------------------------------------------------
+    # Route A: explicit entry transport + folded residual
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fold(v, flip):
+        """
+        Mirror a direction through the tangent plane where `flip` is set.
+
+        The RDM was gathered by firing rays at the stone from *outside*, so
+        its incoming axis only spans theta_i in [0, pi/2]
+        (compute_histogram_4d bins theta_i over that range, and
+        RDMSampler._incoming_bin clips to it). Once Route A lets rays inside,
+        the residual gets queried with wi.z < 0, which would silently clip
+        every internal hit into the single grazing bin and push Model_M --
+        trained only on wi.z >= 0 -- far outside its training domain.
+
+        Folding wi keeps the query in range. `wo` is NOT folded: the RDM's
+        outgoing axis is already expressed relative to the outward normal,
+        and "outward" means the same thing on both sides of the surface.
+        Measured on run_15, 70.5% of rdm_m's outgoing energy sits on the
+        normal's side -- the escaping half -- so mirroring wo as well (as the
+        first version of this did) aimed that 70.5% back into the solid. With
+        a median residual weight of 0.42 per interaction and 3.4 interactions
+        before escape, that delivered about 1/19 of the lobe's energy.
+
+        THIS IS AN APPROXIMATION, and it is the one the k = 1 side gate
+        forces: it reuses the aggregate measured for incidence angle theta
+        from outside as the aggregate for incidence angle theta from inside.
+        Those are not the same distribution -- internal incidence past the
+        critical angle (24.4 deg for diamond) is totally reflected, which has
+        no counterpart on the outside. Removing this approximation means
+        either gathering a second RDM for internal incidence, or moving to
+        the custom-integrator form of Route A where k is a free parameter.
+        """
+        return mi.Vector3f(v.x, v.y, dr.select(flip, -v.z, v.z))
+
+    def sample_entry(self, ctx, si, sample1, active):
+        """
+        The explicit k < 1 term: a smooth dispersive dielectric, matching
+        bsdf/dispersive_dielectric.py exactly. This is what puts real
+        refraction, total internal reflection and E S+ L chains back into the
+        render; the residual RDM never produced them because it only ever
+        returned directions in the hemisphere the ray arrived from.
+        """
+        cos_theta_i = mi.Frame3f.cos_theta(si.wi)
+
+        eta = self._eta(si)
+        F, cos_theta_t, eta_it, eta_ti = mi.fresnel(cos_theta_i, eta)
+        T = dr.maximum(1.0 - F, 0.0)
+
+        # Two independent comparisons rather than `~selected_r`: under the
+        # scalar variants a Dr.Jit mask is a plain Python bool and `~True` is
+        # the integer -2, not False. Same reasoning as DispersiveDielectric.
+        selected_r = active & (sample1 <= F)
+        selected_t = active & (sample1 > F)
+
+        wo = dr.select(selected_r,
+                       mi.reflect(si.wi),
+                       mi.refract(si.wi, cos_theta_t, eta_ti))
+        eta_out = dr.select(selected_r, mi.Float(1.0), eta_it)
+        pdf = dr.select(selected_r, F, T)
+        sampled_type = dr.select(
+            selected_r,
+            mi.UInt32(+mi.BSDFFlags.DeltaReflection),
+            mi.UInt32(+mi.BSDFFlags.DeltaTransmission),
+        )
+
+        # Radiance compresses into the denser medium by eta^2, and must not
+        # be applied when tracing importance rather than radiance.
+        if ctx.mode == mi.TransportMode.Radiance:
+            factor = dr.select(selected_t, dr.sqr(eta_ti), mi.Float(1.0))
+        else:
+            factor = mi.Float(1.0)
+        weight = mi.UnpolarizedSpectrum(factor)
+
+        if IS_SPECTRAL and self.dispersion:
+            # Collapse to the hero wavelength on the way *in* only -- a second
+            # collapse on the way out would apply the factor N twice. This is
+            # where fire enters the neural render: without a real refraction
+            # to attach it to, the spectrum had nothing to fan out along.
+            entering = cos_theta_i > 0.0
+            weight = dr.select(selected_t & entering,
+                               weight * hero_collapse_weight(),
+                               weight)
+
+        return wo, eta_out, pdf, sampled_type, weight
+
+    def sample_residual(self, si, sample1, sample2, active):
+        """
+        The learned term, sampled once: draw an outgoing direction from the
+        RDM and return the one-sample estimator weight.
+
+        Split out of _sample_route_a so an integrator can select it by path
+        depth instead of by which side of the surface the ray arrived from.
+        Depth is the parameter the decomposition in CAUSTIC_LAYER_PLAN.md
+        section 4.2 is written in; the side gate was only ever a stand-in for
+        it, because a BSDF cannot see the depth.
+
+        Returns (wo, pdf, weight) with wo in the local shading frame.
+        """
+        flip = mi.Frame3f.cos_theta(si.wi) < 0.0
+        wi_f = self._fold(si.wi, flip)
+        wo, _ = self.sample_from_rdm(wi_f, sample1, sample2)
+
+        value = dr.clamp(self.eval_model_m_wi(wi_f, wo, si.wavelengths), 0.0, 100.0)
+        pdf = self.pdf_m(wi_f, wo, active)
+        weight = dr.select(active & (pdf > 0.0),
+                           value / dr.maximum(pdf, 1e-6),
+                           mi.UnpolarizedSpectrum(0.0))
+        return wo, pdf, weight
+
     def _lobe_prob(self, si):
         """
         Probability of picking the analytic reflection lobe. Total albedo is
@@ -272,6 +422,9 @@ class NeuralDiamond(mi.BSDF):
         R/T fraction applies the split a second time -- the paper's Eq. 6 is a
         plain sum. Model_T's job here is lobe bookkeeping, not attenuation.
         """
+        if self.explicit_entry:
+            return self._sample_route_a(ctx, si, sample1, sample2, active)
+
         bs = mi.BSDFSample3f()
 
         p_lobe = self._lobe_prob(si)
@@ -306,6 +459,58 @@ class NeuralDiamond(mi.BSDF):
 
         return bs, weight
 
+    def _sample_route_a(self, ctx, si, sample1, sample2, active):
+        """
+        Side-gated k = 1 decomposition (CAUSTIC_LAYER_PLAN.md section 4.2):
+
+            L = L_specular(entry interaction, traced explicitly)
+              + L_rdm     (everything after, learned)
+
+        The gate is the side the ray arrives from. A hit from outside is the
+        entry interaction and goes through the explicit dielectric; every
+        later hit is from inside the solid and goes to the residual.
+
+        The learned half already carries the matching conditioning with no
+        re-gather: utils/rdm.py sets select_m = escaped & (depth >= 3), so
+        rdm_m -- the only histogram Model_M is trained on -- already excludes
+        the short paths this function now traces explicitly. Note the
+        mismatch that leaves: the explicit term covers one interaction while
+        the residual excludes two, so the direct enter-and-exit path
+        (depth == 2, gathered into rdm_t) is represented by neither. That is
+        the known cost of pinning k = 1 to the side gate, and it is the first
+        thing to check if the render comes out dim.
+        """
+        cos_theta_i = mi.Frame3f.cos_theta(si.wi)
+        outside = cos_theta_i > 0.0
+
+        wo_e, eta_e, pdf_e, type_e, weight_e = self.sample_entry(
+            ctx, si, sample1, active)
+
+        # Residual branch, queried on the folded frame.
+        flip = ~outside
+        wi_f = self._fold(si.wi, flip)
+        wo_m, _ = self.sample_from_rdm(wi_f, sample1, sample2)
+        wo_f = wo_m          # queried and scattered in the same direction
+
+        value_m = dr.clamp(
+            self.eval_model_m_wi(wi_f, wo_f, si.wavelengths), 0.0, 100.0)
+        pdf_m = self.pdf_m(wi_f, wo_f, active)
+        weight_m = dr.select(active & (pdf_m > 0.0),
+                             value_m / dr.maximum(pdf_m, 1e-6),
+                             mi.UnpolarizedSpectrum(0.0))
+
+        bs = mi.BSDFSample3f()
+        bs.wo = dr.select(outside, wo_e, wo_m)
+        bs.pdf = dr.select(outside, pdf_e, pdf_m)
+        bs.eta = dr.select(outside, eta_e, mi.Float(1.0))
+        bs.sampled_component = dr.select(outside, mi.UInt32(0), mi.UInt32(1))
+        bs.sampled_type = dr.select(
+            outside, type_e, mi.UInt32(+mi.BSDFFlags.GlossyReflection))
+
+        weight = dr.select(outside, weight_e, weight_m)
+        valid = active & (bs.pdf > 0.0)
+        return bs, dr.select(valid, weight, mi.UnpolarizedSpectrum(0.0))
+
     def _eval_m_clamped(self, si, wo):
         return dr.clamp(self.eval_model_m(si, wo), 0.0, 100.0)
 
@@ -323,6 +528,20 @@ class NeuralDiamond(mi.BSDF):
         multi-scatter term, in matching units (both carry the outgoing
         cosine). No Model_T modulation: see sample().
         """
+        if self.explicit_entry:
+            # Outside hits are a Dirac dielectric, so a direction query can
+            # never land on them and must return exactly zero -- returning a
+            # finite value there would let next-event estimation add energy
+            # the delta lobe already accounts for. Inside hits evaluate the
+            # residual on the folded frame, matching _sample_route_a.
+            outside = mi.Frame3f.cos_theta(si.wi) > 0.0
+            flip = ~outside
+            value = dr.clamp(
+                self.eval_model_m_wi(self._fold(si.wi, flip), wo,
+                                     si.wavelengths), 0.0, 100.0)
+            return dr.select(active & ~outside, dr.maximum(value, 0.0),
+                             mi.UnpolarizedSpectrum(0.0))
+
         value = self.eval_r(si, wo, active)
         if self.model_m is not None:
             value = value + self._eval_m_clamped(si, wo)
@@ -335,6 +554,12 @@ class NeuralDiamond(mi.BSDF):
         Mixture pdf matching sample()'s lobe split, so the two stay consistent
         for MIS and for any integrator that queries pdf() directly.
         """
+        if self.explicit_entry:
+            outside = mi.Frame3f.cos_theta(si.wi) > 0.0
+            flip = ~outside
+            pdf = self.pdf_m(self._fold(si.wi, flip), wo, active)
+            return dr.select(active & ~outside, pdf, 0.0)
+
         p_lobe = self._lobe_prob(si)
         pdf = (p_lobe * self.pdf_r(si, wo, active)
                + (1.0 - p_lobe) * self.pdf_m(si.wi, wo, active))

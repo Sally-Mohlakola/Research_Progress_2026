@@ -75,7 +75,7 @@ def parse_args():
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--output_dir", type=str, default="rolling_animation")
-    parser.add_argument("--frames", type=int, default=10, help="Number of animation frames")
+    parser.add_argument("--frames", type=int, default=60, help="Number of animation frames")
     parser.add_argument("--exposure", type=float, default=None,
                         help="Linear multiplier applied before the gamma curve "
                              "when writing the PNG (the EXR is always raw "
@@ -91,6 +91,12 @@ def parse_args():
                              "facet is near-perfectly smooth); GGX peak scales as 1/alpha^2.")
     parser.add_argument("--no_neural", action='store_true',
                         help="Use analytic dielectric only (ground truth reference)")
+    parser.add_argument("--no_explicit_entry", action='store_true',
+                        help="Disable Route A. The neural BSDF reverts to the "
+                             "S_R + S_M two-lobe form, in which bs.eta is always 1 "
+                             "and no ray ever refracts into the stone, so internal "
+                             "specular transport does not exist. This is the "
+                             "ablation baseline, not a mode to render in.")
     parser.add_argument("--fps", type=int, default=30, help="Video frames per second")
     parser.add_argument("--orbit_radius", type=float, default=5.0, help="Camera orbit radius")
     parser.add_argument("--rotation_speed", type=float, default=1.0, help="Rotation speed multiplier")
@@ -164,19 +170,37 @@ def build_diamond_mesh(diamond_params):
 
 
 def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0,
-                            r_alpha=0.05, dispersion=True):
+                            r_alpha=0.05, dispersion=True, explicit_entry=True):
     """Load neural BSDF with numerical stability."""
     
-    model_m = Model_M().to(device)
+    # Build Model_M at whatever width/encoding it was trained with, if the
+    # checkpoint records it; older checkpoints predate the file and get the
+    # defaults, which are the historical 6-21-21-21-3 shape.
+    arch_path = os.path.join(checkpoint_dir, 'model_m_arch.json')
+    arch = {}
+    if os.path.exists(arch_path):
+        with open(arch_path) as f:
+            arch = json.load(f)
+        print(f"  Model_M architecture from checkpoint: {arch}")
+    model_m = Model_M(**arch).to(device)
     model_m_path = os.path.join(checkpoint_dir, 'model_m.pth')
     
     if not os.path.exists(model_m_path):
         print(f"  ⚠ Model_M not found at {model_m_path}")
         return None
     
-    model_m.load_state_dict(
-        torch.load(model_m_path, map_location=device, weights_only=False)
-    )
+    try:
+        model_m.load_state_dict(
+            torch.load(model_m_path, map_location=device, weights_only=False)
+        )
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Model_M in {model_m_path} does not match the current "
+            f"architecture. Checkpoints trained before the Fourier encoding "
+            f"and width change (run_14 and earlier) have a 6-21-21-21-3 net "
+            f"and must be retrained with train_models.py; the weights cannot "
+            f"be converted. Original error: {e}"
+        ) from e
     model_m.eval()
     print("✓ Model_M weights loaded")
     
@@ -191,12 +215,26 @@ def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0,
         
         # Check for NaN
         if torch.isnan(m_pred).any() or torch.isinf(m_pred).any():
-            print("  ⚠ Model_M output contains nan/inf, using safe activation")
-            activation = lambda x: dr.maximum(0.0, dr.minimum(x, clamp_value))
-        else:
-            # Use clamp with ReLU for stability
-            activation = lambda x: dr.maximum(0.0, dr.minimum(x, clamp_value))
-            print(f"  ✓ Using clamped ReLU activation (max={clamp_value})")
+            print("  ⚠ Model_M output contains nan/inf; clamp will absorb it")
+
+    # Model_M's output nonlinearity is torch.exp (neural/base_model.py), but
+    # MiModelWrapper rebuilds the network from `sequential` alone -- the Linear
+    # and PReLU layers -- so the exp is not carried across and has to be
+    # supplied here. It has to MATCH: the network is trained so that exp(pre)
+    # equals the RDM target, and those targets have median ~0.06, which puts
+    # essentially every pre-activation below zero. Measured on run_15's
+    # weights: 99.9% of pre-activations negative, median -3.77.
+    #
+    # An earlier version applied a clamped ReLU here instead. That returned
+    # exactly zero for 99.9% of queries, so the neural lobe contributed 0.054%
+    # of the rendered energy and only bins whose target exceeded 1.0 survived
+    # -- scattered bright points on a black stone. Every neural render before
+    # this fix (diamond_test_10, _12, _22, _23) carries that defect.
+    #
+    # The inner minimum caps the exponent so a large activation cannot
+    # overflow to inf; the outer one is the caller's clamp_value.
+    activation = lambda x: dr.minimum(dr.exp(dr.minimum(x, 20.0)), clamp_value)
+    print(f"  ✓ Using exp activation, matching Model_M (clamped at {clamp_value})")
 
     class WrapperWithSkip(MiModelWrapper):
         def test(self, samples=42900):
@@ -212,6 +250,7 @@ def load_neural_bsdf_direct(checkpoint_dir, diamond_params, clamp_value=10.0,
     props['type'] = 'neural_diamond'
     props['r_alpha'] = r_alpha
     props['dispersion'] = dispersion
+    props['explicit_entry'] = explicit_entry
 
     bsdf = NeuralDiamond(props)
     bsdf.model_m = mlp_m
@@ -680,7 +719,8 @@ def main():
     else:
         print("✓ Mode: neural shading (Model_M + DiamondFacet)")
         bsdf = load_neural_bsdf_direct(checkpoint_dir, diamond_params,
-                                       args.clamp_value, args.r_alpha, dispersion)
+                                       args.clamp_value, args.r_alpha, dispersion,
+                                       not args.no_explicit_entry)
         if bsdf is None:
             print("⚠ Neural BSDF failed to load - falling back to dielectric")
             bsdf = load_analytic_bsdf(diamond_params, dispersion)

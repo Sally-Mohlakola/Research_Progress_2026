@@ -185,10 +185,21 @@ def trace_path(scene, rays, max_depth=10000):
 # 4D histogram accumulation
 # ─────────────────────────────────────────────
 
-def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360):
+def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360,
+                          active=None):
     """
     Bin (omega_i, omega_o, throughput) samples into a 4D directional
     histogram and normalize into radiance-per-solid-angle.
+
+    `active` masks out samples that carry no information at all -- in
+    practice, rays that never intersected the stone. Those have an
+    undefined first-hit shading frame, so their (omega_i, omega_o) is
+    meaningless, and letting them through would inflate the per-bin
+    *count* while contributing zero throughput, biasing the bin mean
+    toward black in proportion to the miss rate. This matters as soon as
+    ray origins are jittered off the stone's centre (see collect_rdm):
+    with a centre-aimed beam essentially every ray hits and the mask is a
+    no-op, with an area beam a large fraction of rays miss by design.
 
     IMPORTANT: the per-bin mean computed below (sum of throughput in a
     bin / count of samples that landed in that bin) is *already* an
@@ -227,6 +238,9 @@ def compute_histogram_4d(omega_i, omega_o, outputs, theta_bins=180, phi_bins=360
         & (theta_o_idx >= 0) & (theta_o_idx < theta_bins)
         & (phi_o_idx >= 0) & (phi_o_idx < phi_bins)
     )
+
+    if active is not None:
+        valid_mask = valid_mask & active
 
     shape = (theta_bins // 2, phi_bins, theta_bins, phi_bins, 3)
     s = dr.zeros(mi.Float, dr.prod(shape))
@@ -363,9 +377,42 @@ def sample_directions_stratified(num_samples, theta_bins=8, phi_bins=16):
 
     return dirs_np
 
+def sample_aim_offsets(dirs_np, radius):
+    """
+    For each unit direction in `dirs_np`, sample an offset uniformly over
+    the disc of the given radius lying in the plane perpendicular to that
+    direction.
+
+    Adding this offset to a ray origin turns the gather beam from a single
+    line through the stone's centre into a parallel beam covering the
+    stone's whole projected silhouette -- which is what makes every facet
+    reachable at every incidence angle. See collect_rdm for why that
+    matters.
+    """
+    u = dirs_np
+    # Branchless orthonormal basis: pick whichever cardinal axis is least
+    # aligned with u, so the cross product is never near-degenerate.
+    helper = np.zeros_like(u)
+    least = np.argmin(np.abs(u), axis=-1)
+    helper[np.arange(len(u)), least] = 1.0
+
+    t1 = np.cross(u, helper)
+    t1 /= np.linalg.norm(t1, axis=-1, keepdims=True)
+    t2 = np.cross(u, t1)
+
+    # sqrt(xi) keeps the samples uniform per unit *area*, not per unit
+    # radius -- otherwise the beam is over-concentrated at the centre and
+    # under-samples the girdle, which is exactly the region that produces
+    # grazing incidence.
+    r = radius * np.sqrt(np.random.rand(len(u)))
+    phi = 2.0 * np.pi * np.random.rand(len(u))
+
+    return (r * np.cos(phi))[:, None] * t1 + (r * np.sin(phi))[:, None] * t2
+
+
 def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
                  theta_bins=180, phi_bins=360, max_depth=4096,
-                 sampling_method='stratified'):
+                 sampling_method='stratified', aim_jitter=True):
     """
     Fire `num_samples` rays inward from random directions on a sphere that
     safely encloses the diamond, trace them through the dielectric, and
@@ -377,10 +424,16 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
     coverage decision). It no longer feeds into any post-hoc histogram
     correction; compute_histogram_4d's per-bin mean is already an
     unbiased estimator regardless of which of these you use.
+
+    aim_jitter: fire each ray from a random point on the disc of radius
+    `bounding_radius` perpendicular to its direction, instead of aiming it
+    at the stone's centre. This is not a variance-reduction tweak -- it
+    changes which (facet, incidence angle) pairs are reachable at all, and
+    a centre-aimed beam cannot cover the domain. See below.
     """
-    # Origins on a sphere of radius >> bounding_radius, aimed at the
-    # origin -- comfortably outside the stone so rays start in free space,
-    # not touching the girdle.
+    # Origins on a sphere of radius >> bounding_radius -- comfortably
+    # outside the stone so rays start in free space, not touching the
+    # girdle.
     origin_radius = 3.0 * bounding_radius
 
     # Choose sampling method
@@ -398,10 +451,29 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
     else:
         raise ValueError(f"Unknown sampling method: {sampling_method}")
 
+    # Aiming every ray at the origin makes each sampled direction produce
+    # exactly one ray: the line from 3R*u through the stone's centre. That
+    # line enters through whichever facet the centre "sees" in direction u,
+    # so a given facet is only ever entered by the narrow cone of
+    # directions it subtends from the centre -- a few degrees wide. The
+    # local incidence angle on that facet is therefore pinned near its
+    # normal, and the (theta_i, phi_i) bins away from normal incidence are
+    # never populated for it. Measured on round_diamond_gia, the whole
+    # grazing band theta_i in [67.5, 90] came back empty, 0 of 16 bins.
+    #
+    # Offsetting the origin across the disc perpendicular to the beam fixes
+    # this: the stone is then swept by a uniform parallel beam over its
+    # full projected area, every facet is entered off-centre as well as
+    # head-on, and grazing incidence becomes reachable. The direction of
+    # each ray is unchanged, so the incoming-direction distribution the
+    # sampling_method above was chosen to produce is preserved exactly.
+    aim = (sample_aim_offsets(dirs_np, bounding_radius) if aim_jitter
+           else np.zeros_like(dirs_np))
+
     o = mi.Point3f(
-        mi.Float(dirs_np[:, 0]) * origin_radius,
-        mi.Float(dirs_np[:, 1]) * origin_radius,
-        mi.Float(dirs_np[:, 2]) * origin_radius,
+        mi.Float(dirs_np[:, 0] * origin_radius + aim[:, 0]),
+        mi.Float(dirs_np[:, 1] * origin_radius + aim[:, 1]),
+        mi.Float(dirs_np[:, 2] * origin_radius + aim[:, 2]),
     )
     d = mi.Vector3f(-mi.Float(dirs_np[:, 0]), -mi.Float(dirs_np[:, 1]), -mi.Float(dirs_np[:, 2]))
 
@@ -409,9 +481,20 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
 
     wi, wo, throughput, depth, frame, escaped = trace_path(scene, ray, max_depth=max_depth)
 
-    # Rays that never hit the diamond at all (depth==0, e.g. missed
-    # entirely from sampling direction noise) carry no information.
-    throughput = dr.select(depth < 1, 0.0, throughput)
+    # Rays that never hit the diamond at all carry no information. With a
+    # centre-aimed beam that is a handful of rays lost to sampling noise;
+    # with aim_jitter it is a designed-for fraction (the disc is the
+    # stone's bounding circle, so everything between the silhouette and
+    # that circle misses). Either way they must be excluded from the
+    # histogram *counts* as well as zeroed in throughput -- see
+    # compute_histogram_4d's `active` argument.
+    hit = depth >= 1
+    throughput = dr.select(~hit, 0.0, throughput)
+
+    missed = int(dr.count(~hit)[0])
+    if missed > 0:
+        print(f"  {missed}/{num_samples} rays missed the stone "
+              f"({100.0 * missed / num_samples:.1f}%); excluded from the histogram")
 
     not_escaped = int(dr.count(~escaped & (depth >= 1))[0])
     if not_escaped > 0:
@@ -441,9 +524,9 @@ def collect_rdm(scene, bounding_radius, num_samples=1024 * 1024 * 16,
     # across T/R/M, so the "count" (number of samples landing in each
     # incoming-direction bin) is identical for all three -- compute it once
     # instead of three times.
-    rdm_t, count_i = compute_histogram_4d(wi, wo, throughput_t, theta_bins, phi_bins)
-    rdm_r, _        = compute_histogram_4d(wi, wo, throughput_r, theta_bins, phi_bins)
-    rdm_m, _        = compute_histogram_4d(wi, wo, throughput_m, theta_bins, phi_bins)
+    rdm_t, count_i = compute_histogram_4d(wi, wo, throughput_t, theta_bins, phi_bins, active=hit)
+    rdm_r, _        = compute_histogram_4d(wi, wo, throughput_r, theta_bins, phi_bins, active=hit)
+    rdm_m, _        = compute_histogram_4d(wi, wo, throughput_m, theta_bins, phi_bins, active=hit)
 
     print(f"Total rays traced: {dr.width(wi)}")
 
@@ -463,11 +546,16 @@ def compute_rdm(
     batch_size=1024 * 8,
     diamond_kwargs=None,
     sampling_method='stratified',
+    aim_jitter=True,
 ):
     """
     Accumulate the RDM over many batches of randomly-directed rays fired
     at the diamond, averaging transmittance/reflectance/multi-scatter
     histograms across batches.
+
+    aim_jitter=False restores the old centre-aimed beam, for reproducing
+    pre-fix checkpoints (run_09, run_10, run_14). It is not a good default:
+    see collect_rdm.
     """
     diamond_kwargs = diamond_kwargs or {}
     scene, bounding_radius = build_diamond_scene(**diamond_kwargs)
@@ -485,7 +573,8 @@ def compute_rdm(
 
     for i in range(num_batches):
         rdm_t_, rdm_r_, rdm_m_, count_t_, count_r_, count_m_ = collect_rdm(
-            scene, bounding_radius, batch_size, theta_bins, phi_bins, max_depth, sampling_method,
+            scene, bounding_radius, batch_size, theta_bins, phi_bins, max_depth,
+            sampling_method, aim_jitter,
         )
 
         dr.eval(rdm_t_, rdm_r_, rdm_m_, count_t_, count_r_, count_m_)
